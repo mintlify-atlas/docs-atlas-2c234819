@@ -1,0 +1,96 @@
+---
+title: "Admin Backoffice: Managing Queues and Daily Operations"
+description: "A guide to the SGR-Turnos admin backoffice, covering the dashboard, daily turn management, printing the official roster, and marking turns as used."
+---
+
+The SGR-Turnos admin backoffice is the operational control centre for branch staff. It is accessible only to authenticated users with at least `ROLE_ADMIN`, and all actions are recorded in a full audit log that stores a before/after JSON snapshot, the originating IP address (anonymised with SHA-256 + mask), and the acting user. The backoffice runs entirely on the local branch network — no internet access is required.
+
+## Logging In
+
+Navigate to `/login` and authenticate with your branch credentials. Passwords are hashed with bcrypt/argon2 and a minimum length of 8 characters is enforced. All login and logout events are captured by the `EventSubscriber`.
+
+After a successful login you are redirected to `/admin`, which maps to `DashboardController::index()`.
+
+## Dashboard — `/admin`
+
+The dashboard is rendered by `DashboardController` using data assembled by `DashboardInterface::getDashboardData()`. It provides an at-a-glance summary of today's activity across all services: total turns reserved, turns marked as used, remaining available tickets, and quick-stats for the past 7 days from each active service's daily configurations.
+
+## Daily Turns View — `/admin/turnos/hoy`
+
+`TurnoController::listadoHoy()` renders the main operational screen for a working day. It lists all turns for today — filtered by `configuracion_diaria.fecha = today` — paginated at 15 rows per page. Staff can filter by service using the selector at the top of the page.
+
+Each row in the table shows:
+
+| Column | Source |
+|---|---|
+| N° Turno | `turno.numero_turno` (monospaced, prefixed with `#`) |
+| Cliente | `turno.cliente.nombre_completo` |
+| CI | `turno.cliente.numero_identidad` |
+| Monto Permitido | `turno.monto_permitido` |
+| Estado | `turno.estado` rendered via `EstadoTurno::getLabel()` |
+| Hora Reserva | `turno.fecha_reserva` (time portion) |
+
+For services with `listado_unico = true` (i.e. `configuracion_diaria = false` AND `listadoUnico = true`), the view switches to an all-turns listing (not filtered by date) and shows the reservation date instead of the time.
+
+### Marking a Turn as Used
+
+When the custodian crosses a CI off the printed roster, the admin marks the corresponding turn as **USADO** through the backoffice. Under the hood, `Turno::marcarComoUsado(Usuario $usuario)` is called, which:
+
+1. Sets `estado = EstadoTurno::USADO`.
+2. Sets `fecha_uso = new \DateTime()`.
+3. Stores the acting admin user in `marcado_por`.
+
+This transition is what **activates the frequency block** for that client's CI. From this moment, `FrecuenciaService` will calculate a `fecha_desbloqueo` equal to `configuracion_diaria.fecha + servicio.dias_bloqueo` days, preventing the same CI from reserving a new turn for that service until the block expires.
+
+### Editing a Turn
+
+Clicking the pencil icon opens a modal form. Admins can change the CI, the service, and the target date. The system validates that a `ConfiguracionDiaria` record exists for the new service/date combination, that it has `estado = ABIERTA`, and that tickets are still available. The edit executes inside a `RetryableTransactionTrait` transaction with optimistic locking to handle concurrent edits safely.
+
+<Note>
+  Editing a turn automatically returns one ticket to the original `ConfiguracionDiaria` (if its estado is still `ABIERTA`) and decrements one from the new configuration, preserving accurate ticket counts.
+</Note>
+
+## Printing the Official Daily Roster
+
+The **Imprimir** button navigates to `/admin/turnos/imprimir` (opens in a new tab), which renders `templates/admin/turnos/print.html.twig`. This is a standalone HTML page — no admin layout — optimised for CSS `@media print`. The printed document contains:
+
+- Institutional header: **BANDEC — LISTADO OFICIAL DE ATENCIÓN**
+- Filter description (date range, service name, estado filter)
+- A table with three columns: **N° Turno**, **CI / Tarjeta**, and a **Firma del Custodio** signature line for the physical roster.
+- Footer with total clients attended and a cashier signature block.
+
+The custodian uses this printed list to verify identities at the ATM or teller window and manually crosses off each turn as the customer is served. That physical mark is the basis for marking turns as USADO in the backoffice.
+
+## Exporting Turns to Excel
+
+The **Exportar Excel** button calls `GET /admin/turnos/exportar-excel`. `TurnoController::exportarExcel()` uses [PhpSpreadsheet](https://phpspreadsheet.readthedocs.io/) to generate an `.xlsx` file. The spreadsheet contains eight columns:
+
+| Column | Content |
+|---|---|
+| A — N° Turno | `turno.numero_turno` |
+| B — CI / Tarjeta | `turno.cliente.numero_identidad` (forced to string type to preserve leading zeros) |
+| C — Cliente | `turno.cliente.nombre_completo` |
+| D — Servicio | `turno.servicio.nombre` |
+| E — Monto Permitido | `turno.monto_permitido` |
+| F — Estado | `turno.estado.getLabel()` |
+| G — Hora Reserva | `turno.fecha_reserva` (HH:mm:ss) |
+| H — Fecha Configuración | `configuracion_diaria.fecha` (or `—` for listado único turns without a config) |
+
+Column widths are set to auto-size. The file is named `turnos_{servicio_nombre}.xlsx` and returned inline for immediate download.
+
+## Related Pages
+
+<CardGroup cols={2}>
+  <Card title="Service Management" icon="gear" href="/features/service-management">
+    Create and configure ATM and teller service types, including frequency control, daily quotas, and booking parameters.
+  </Card>
+  <Card title="Daily Calendar" icon="calendar" href="/features/daily-calendar">
+    Define per-day cash load, per-person limit, and ticket quota for each service operating day.
+  </Card>
+  <Card title="User Roles" icon="shield" href="/admin/user-roles">
+    Manage the four hierarchical roles: Super Admin, Admin, Supervisor, and Operator.
+  </Card>
+  <Card title="Reports & Export" icon="chart-bar" href="/admin/reports-export">
+    Audit logs, full turn history, and Excel export across date ranges and services.
+  </Card>
+</CardGroup>

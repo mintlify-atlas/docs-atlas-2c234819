@@ -1,0 +1,140 @@
+---
+title: "Anti-Scalping: Frequency Control and Turn Blocking"
+description: "How SGR-Turnos blocks a client's identity card for a configurable number of days after each ATM withdrawal and rate-limits the public CI entry endpoint."
+---
+
+SGR-Turnos was designed explicitly to eliminate "colerismo"—the practice of people holding or selling queue positions and making repeated ATM withdrawals in rapid succession, leaving the branch without cash for other customers. The system addresses this at two levels: a per-identity-card frequency block that prevents re-registration within a configurable window, and an IP-level rate limiter that stops automated scripts from enumerating or abusing the public CI entry endpoint.
+
+## How frequency control works
+
+Frequency control is an opt-in feature enabled per service. When a `Servicio` entity has `requiere_control_frecuencia = true`, the system tracks every client's last successfully used turn for that service and refuses to issue a new turn until a configurable number of days have elapsed.
+
+<Note>
+  `dias_bloqueo` is configured individually on each `Servicio` record, so different services can enforce different blocking periods. An ATM service might block for 7 days while a teller window service uses 3.
+</Note>
+
+### The blocking lifecycle
+
+1. **Turn reservation**: a client enters their CI at the public terminal. If the service requires frequency control, `FrecuenciaService::puedeTomarTurno()` is called to determine whether the client is currently within a blocking period.
+2. **Turn used**: an operator marks the turn as `USADO` via `Turno::marcarComoUsado()`. This sets `fecha_uso` to the current timestamp and records which operator performed the action.
+3. **Next visit**: on the client's next CI entry, `FrecuenciaService::getFechaDesbloqueo()` looks up their last turn for the service, adds `dias_bloqueo` days to the turn's `ConfiguracionDiaria` date, and compares the result against today. If the unlock date is still in the future, the terminal displays it and prevents reservation.
+
+### `FrecuenciaService` in detail
+
+`FrecuenciaService` (`src/Service/FrecuenciaService.php`) implements `FrecuenciaInterface` and contains three public methods:
+
+```php src/Service/FrecuenciaService.php
+public function getFechaDesbloqueo(Cliente $cliente, Servicio $servicio): ?\DateTimeInterface
+{
+    $ultimoTurno = $this->getUltimoTurno($cliente, $servicio);
+    if (!$ultimoTurno) {
+        return null;
+    }
+
+    $fechaTurno = $ultimoTurno->getConfiguracionDiaria()->getFecha();
+    $diasBloqueo = $servicio->getDiasBloqueo() ?? 0;
+    $fechaDesbloqueo = (clone $fechaTurno)->modify("+{$diasBloqueo} days");
+
+    $hoy = new \DateTime('today');
+    return $fechaDesbloqueo > $hoy ? $fechaDesbloqueo : null;
+}
+
+public function puedeTomarTurno(Cliente $cliente, Servicio $servicio, ?\DateTimeInterface $fechaDeseada = null): bool
+{
+    $fechaDesbloqueo = $this->getFechaDesbloqueo($cliente, $servicio);
+    if (!$fechaDesbloqueo) {
+        return true;
+    }
+    $fechaDeseada = $fechaDeseada ?? new \DateTime('today');
+    return $fechaDeseada >= $fechaDesbloqueo;
+}
+```
+
+Key points:
+
+- `getFechaDesbloqueo()` returns `null` in two cases: the client has no prior turn for this service, or the blocking period has already expired. Both cases allow reservation to proceed.
+- The blocking window is computed from the **date of the daily configuration** (`ConfiguracionDiaria::getFecha()`), not from `fecha_uso`. This ensures the block duration is calendar-day-aligned rather than tied to the exact hour of withdrawal.
+- `puedeTomarTurno()` accepts an optional `$fechaDeseada` parameter so that future-date reservations (on services that allow advance booking) are evaluated against the correct target date, not today.
+
+### Bulk status check for the service selector
+
+When the service selection screen loads, the system calls `getBloqueosPorCliente()` to compute the block status for every available service in one pass:
+
+```php src/Service/FrecuenciaService.php
+public function getBloqueosPorCliente(Cliente $cliente, array $servicios): array
+{
+    $result = [];
+    foreach ($servicios as $servicio) {
+        $fechaDesbloqueo = $this->getFechaDesbloqueo($cliente, $servicio);
+        $result[$servicio->getId()] = [
+            'servicio'        => $servicio,
+            'bloqueado'       => $fechaDesbloqueo !== null,
+            'fechaDesbloqueo' => $fechaDesbloqueo,
+        ];
+    }
+    return $result;
+}
+```
+
+The returned array is keyed by service ID and contains a `bloqueado` boolean and the `fechaDesbloqueo` date, which the Twig template uses to display an unlock date badge on blocked services.
+
+### The `FrecuenciaInterface` contract
+
+The service is consumed through `FrecuenciaInterface` (`src/Service/FrecuenciaInterface.php`), making it straightforward to substitute a different implementation (for example, one backed by a cache layer) without changing any controller code:
+
+```php src/Service/FrecuenciaInterface.php
+interface FrecuenciaInterface
+{
+    public function getUltimoTurno(Cliente $cliente, Servicio $servicio): ?Turno;
+    public function getFechaDesbloqueo(Cliente $cliente, Servicio $servicio): ?\DateTimeInterface;
+    public function puedeTomarTurno(Cliente $cliente, Servicio $servicio, ?\DateTimeInterface $fechaDeseada = null): bool;
+
+    /** @return array<int, array{servicio: Servicio, bloqueado: bool, fechaDesbloqueo: ?\DateTimeInterface}> */
+    public function getBloqueosPorCliente(Cliente $cliente, array $servicios): array;
+}
+```
+
+## Rate limiting on the public endpoint
+
+Even before frequency control runs, the `/ingreso/procesar` endpoint is guarded by Symfony's rate limiter. This protects against scripts that repeatedly submit CI numbers to probe block status or enumerate valid identities.
+
+### How it is wired
+
+`IngresoController` declares a dependency on `RateLimiterFactory $limiter_ingreso_ci`. Symfony's dependency injection resolves this to the limiter factory named `limiter_ingreso_ci` defined in `config/packages/rate_limiter.yaml`. Each request to `procesar()` creates a limiter instance keyed to the client's IP address and immediately consumes one token:
+
+```php src/Controller/IngresoController.php
+#[Route('/ingreso/procesar', name: 'app_ingreso_procesar', methods: ['POST'])]
+public function procesar(Request $request): Response
+{
+    // 1. Rate limiting by IP
+    $limiter = $this->limiter_ingreso_ci->create($request->getClientIp());
+    $limit = $limiter->consume();
+
+    if (!$limit->isAccepted()) {
+        $retryAfter = $limit->getRetryAfter()->getTimestamp() - time();
+        throw new TooManyRequestsHttpException(
+            $retryAfter,
+            'Demasiados intentos. Por favor, espere unos segundos.'
+        );
+    }
+
+    // ... CI validation continues below
+}
+```
+
+When the bucket is exhausted, `TooManyRequestsHttpException` is thrown with a `Retry-After` value in seconds, which Symfony translates into a standard HTTP 429 response with the appropriate header. The CI validation and database lookup that follow are never reached.
+
+<Tip>
+  The rate limiter runs before any database query, so even a high volume of rejected requests has negligible backend cost.
+</Tip>
+
+## CI validation after the rate check
+
+Only requests that pass the rate limiter reach the Cuban CI validation logic in `IngresoController::validarCI()`. The method:
+
+1. Confirms the CI is exactly 11 digits.
+2. Extracts the year (digits 0–1), month (2–3), day (4–5), and century indicator (digit 6).
+3. Resolves the full four-digit birth year: digits 0–4 map to 1900s, 5–8 to 2000s, and 9 to 1800s.
+4. Calls `checkdate($mes, $dia, $anioCompleto)` to reject impossible dates such as February 30.
+
+If any check fails, a flash error is added and the client is redirected back to the ingreso form without touching the session or the database.

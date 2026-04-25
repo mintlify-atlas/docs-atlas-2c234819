@@ -1,0 +1,87 @@
+---
+title: "Reports and Export: Rosters and Excel Exports"
+description: "Generate the official daily turn roster for ATM custodians or export turn data to Excel from the SGR-Turnos admin interface using PhpSpreadsheet."
+---
+
+SGR-Turnos provides two output formats for turn data: a print-optimized HTML roster designed to be physically handed to the ATM custodian, and an Excel (`.xlsx`) file for digital record-keeping or further analysis. Both are generated on demand from the turn list views and reflect the current state of the database at the moment of the request — no pre-generation or caching is involved.
+
+## The Official Daily Roster (Print)
+
+The daily roster is a dedicated print view served at `/admin/turnos/imprimir`. It renders the `admin/turnos/print.html.twig` template, which is designed exclusively for printing — not for on-screen navigation. The roster is the document handed to the ATM custodian at the start of each day; the custodian physically crosses off each turn as clients are attended, and the admin team later enters those marks into the system.
+
+### Accessing the Print View
+
+From `/admin/turnos/hoy` (or `/admin/listados`), select the desired service and apply any date or status filters, then trigger the print action. The `imprimir` route in `TurnoController` accepts the same query parameters as the list views:
+
+| Parameter | Description |
+|---|---|
+| `servicio` | ID of the service to filter by. If omitted, all active services are included. |
+| `fecha_inicio` | Start date (`Y-m-d`). Ignored for "Listado Único" type services. |
+| `fecha_fin` | End date (`Y-m-d`). Ignored for "Listado Único" type services. |
+| `estado` | Turn status filter (`RESERVADO`, `USADO`, `CANCELADO`, `EXPIRADO`). |
+
+The controller builds a filter description string that appears in the printed header — for example, `FECHA: 25/04/2026` for a single-day filter, or `DESDE 01/04/2026 HASTA 25/04/2026` for a range. For "Listado Único" services (those that do not use daily configurations), the header reads `LISTADO ÚNICO - SERVICIO: <nombre>`.
+
+<Note>
+  The print roster uses CSS `@media print` rules to produce a clean, browser-printable layout. On-screen navigation elements, sidebars, and action buttons are hidden when printing. This means you can use the browser's native "Print" function (Ctrl+P / Cmd+P) directly on the `/admin/turnos/imprimir` page — no additional print driver or PDF generator is required. The system is designed to work with standard matrix or laser printers on the local network.
+</Note>
+
+### The Custodian Workflow
+
+The roster enables a paper-based reconciliation workflow:
+
+<CardGroup cols={3}>
+  <Card title="1. Print Roster" icon="print">
+    At the start of the day, an admin prints the official roster from `/admin/turnos/imprimir` filtered to today's date and the relevant service.
+  </Card>
+  <Card title="2. Custodian Works the Queue" icon="clipboard-check">
+    The custodian receives the printed list and crosses off each turn number as the corresponding client completes their transaction at the ATM.
+  </Card>
+  <Card title="3. Admin Marks Turns as Used" icon="check-double">
+    At the end of the day (or during the day), an admin returns to `/admin/turnos/hoy` and marks each completed turn as `USADO`. This triggers the anti-scalping frequency lock on the client's CI.
+  </Card>
+</CardGroup>
+
+## Excel Export
+
+The Excel export is available at `/admin/turnos/exportar-excel` and accepts the same filter query parameters as the print view. It uses the **PhpSpreadsheet** library to generate a native `.xlsx` file, which is streamed directly to the browser as an inline download.
+
+### Spreadsheet Structure
+
+The exported file contains a single sheet with the following columns, in order:
+
+| Column | Field | Notes |
+|---|---|---|
+| A | N° Turno | Turn number (e.g. `ATM-001`) |
+| B | CI / Tarjeta | Client identity number, stored explicitly as a string to prevent spreadsheet applications from truncating leading zeros |
+| C | Cliente | Client full name |
+| D | Servicio | Service name |
+| E | Monto Permitido | Permitted withdrawal amount (decimal) |
+| F | Estado | Turn status label (`Reservado`, `Usado`, `Cancelado`, `Expirado`) |
+| G | Hora Reserva | Time the reservation was created (`HH:mm:ss`) |
+| H | Fecha Configuración | Date of the associated daily configuration (`YYYY-MM-DD`), or `—` for turns without a daily configuration |
+
+The header row (A1:H1) is bold and has a light gray fill (`#E0E0E0`). All columns have auto-sized widths. The file is named `turnos_<nombre_servicio>.xlsx` when a specific service is selected, or `turnos_todos.xlsx` when no service filter is applied.
+
+### Generating the Export
+
+```
+GET /admin/turnos/exportar-excel?servicio=<id>&fecha_inicio=2026-04-25&fecha_fin=2026-04-25
+```
+
+The response uses `ResponseHeaderBag::DISPOSITION_INLINE`, so the browser typically opens a save dialog or previews the file in a spreadsheet viewer, depending on the client's configuration. No temporary files are left on the server after the response is sent.
+
+<Warning>
+  The Excel export does not apply any row limit. For services with a large number of turns across a wide date range, the export can take several seconds and generate a large file. Apply `fecha_inicio` and `fecha_fin` filters to limit the result set when exporting historical data.
+</Warning>
+
+## Accessing Both Features from the Turn List
+
+Both export actions are surfaced from the same turn management views:
+
+- **`/admin/turnos/hoy`** — shows today's turns for the selected service, paginated at 15 per page. The print and export buttons apply the current service and date context automatically.
+- **`/admin/listados`** — the general turn roster view, supporting multi-day date ranges and status filters. Use this view when generating reports for a period other than today (e.g. end-of-week reconciliation).
+
+<Tip>
+  For "Listado Único" services — those configured with `listado_unico = true` and `configuracion_diaria = false` — the date filters are ignored entirely. The roster and export will always include all turns for that service regardless of date, since these services do not operate on a daily configuration cycle.
+</Tip>

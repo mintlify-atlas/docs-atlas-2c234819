@@ -1,0 +1,81 @@
+---
+title: "Security Features in SGR-Turnos"
+description: "SGR-Turnos uses CSRF tokens, rate limiting, bcrypt passwords, Symfony Voters, HMAC-SHA256 IP anonymization, and optimistic locking to protect against fraud."
+---
+
+SGR-Turnos is a bank branch queue management system running entirely on a local network, which means its security surface is primarily internal. Even so, the system applies defense-in-depth: every form is CSRF-protected, public endpoints are rate-limited to stop automated abuse, passwords are hashed with bcrypt or argon2, authorization decisions go through Symfony voters rather than ad hoc role checks, and the audit log records every significant action without exposing raw IP addresses. This page summarizes all active protections. For the two mechanisms with the most operational impact, follow the links below.
+
+<CardGroup cols={2}>
+  <Card
+    title="Anti-scalping: frequency control and turn blocking"
+    icon="ban"
+    href="/security/anti-scalping"
+  >
+    How SGR-Turnos automatically blocks a client's identity card for a configurable number of days after each ATM withdrawal, and how rate limiting stops IP-level brute-forcing of the public CI entry form.
+  </Card>
+  <Card
+    title="Concurrency control: safe concurrent turn assignment"
+    icon="lock"
+    href="/security/concurrency"
+  >
+    How optimistic locking, retryable transactions, pessimistic SELECT FOR UPDATE, and a unique database constraint work together to prevent duplicate turn numbers when multiple operators work simultaneously.
+  </Card>
+</CardGroup>
+
+## All protections at a glance
+
+| Protection | Where it applies | Mechanism |
+|---|---|---|
+| CSRF tokens | All POST forms (admin and public) | Symfony's built-in CSRF component; token embedded in each form and validated server-side |
+| Rate limiting | `/ingreso/procesar` (CI entry) | `RateLimiterFactory` (`limiter_ingreso_ci`); excess requests throw `TooManyRequestsHttpException` |
+| Password hashing | User accounts | bcrypt or argon2 via Symfony's `PasswordHasherFactory`; minimum 8 characters enforced |
+| Voter authorization | Turn and user management routes | `TurnoVoter` (VIEW/EDIT/DELETE) and `UsuarioVoter` (EDIT/DELETE/TOGGLE) in `src/Security/Voter/` |
+| IP anonymization | Audit log (`auditoria` table) | HMAC-SHA-256 of the raw IP keyed with `APP_SECRET`; raw IP is never stored |
+| CI format validation | Public ingreso form | 11-digit length check + birth-date extraction and `checkdate()` verification |
+| Frequency block | Per-service turn reservation | `FrecuenciaService` computes unlock date from last use; blocks re-entry within `dias_bloqueo` days |
+| Optimistic locking | `ConfiguracionDiaria` updates | Doctrine `@Version` field; concurrent writes collide and raise `OptimisticLockException` |
+| Retryable transactions | Turn creation and daily config updates | `RetryableTransactionTrait` wraps critical operations in a retry loop (up to 3 attempts) |
+| Unique DB constraint | `numero_turno` per configuration | `uk_turno_configuracion_numero` unique constraint as a last-resort duplicate guard |
+
+## CSRF protection
+
+Every state-changing form in the application—whether in the admin backoffice or on the public registration terminal—includes a Symfony CSRF token. The token is generated per-session and validated on the server before any data is processed. This prevents cross-site request forgery attacks where an external page could silently submit a form on behalf of an authenticated operator.
+
+## Rate limiting on the CI entry endpoint
+
+The public ingreso form at `/ingreso/procesar` is the only unauthenticated endpoint that triggers database writes. `IngresoController` creates a limiter keyed to the client's IP address using the `limiter_ingreso_ci` factory. If the limit is exceeded, Symfony raises a `TooManyRequestsHttpException` with a `Retry-After` header computed from the limiter's next-available timestamp. This stops automated scripts from enumerating identity card numbers. See [Anti-scalping](/security/anti-scalping) for the full code walkthrough.
+
+## Password hashing
+
+Operator and administrator passwords are hashed using bcrypt or argon2, selected automatically by Symfony's password hasher based on the runtime environment. Plaintext passwords are never stored or logged. The system enforces a minimum length of 8 characters at creation time and requires a password change on first login for accounts created by administrators.
+
+## Voter-based authorization
+
+Rather than scattering `isGranted('ROLE_X')` checks across controllers, SGR-Turnos encapsulates all authorization logic in two dedicated voter classes.
+
+**`TurnoVoter`** (`src/Security/Voter/TurnoVoter.php`) governs access to turn records:
+
+| Attribute | Roles allowed |
+|---|---|
+| `VIEW` | `ROLE_OPERADOR`, `ROLE_ADMIN`, `ROLE_SUPER_ADMIN` |
+| `EDIT` | `ROLE_ADMIN`, `ROLE_SUPER_ADMIN` |
+| `DELETE` | `ROLE_SUPER_ADMIN` only |
+
+**`UsuarioVoter`** (`src/Security/Voter/UsuarioVoter.php`) governs user management:
+
+- Only `ROLE_ADMIN` and `ROLE_SUPER_ADMIN` can manage other users.
+- No user can edit or delete their own account through this path.
+- A `ROLE_ADMIN` cannot modify a `ROLE_SUPER_ADMIN` account—privilege escalation in reverse is also blocked.
+
+## IP anonymization in the audit log
+
+`AuditoriaService` calls `IpAnonymizerService::anonymize()` before writing the `ip_origen` field to the `auditoria` table. The implementation uses `hash_hmac('sha256', $ip, $this->secret)`, where `$this->secret` is the application's `APP_SECRET` environment variable. The result is a 64-character hex string that is consistent for the same IP within a deployment but cannot be reversed without the secret. A lighter alternative, `anonymizePartial()`, zeroes out the last IPv4 octet (e.g., `192.168.1.100` → `192.168.1.0`) for cases where partial traceability is acceptable.
+
+## Cuban identity card (CI) validation
+
+The public registration form strips non-digit characters from the submitted CI and then applies a two-step validation in `IngresoController::validarCI()`:
+
+1. **Length**: the CI must be exactly 11 digits.
+2. **Birth date**: digits 0–1 encode the year, 2–3 the month, 4–5 the day, and digit 6 encodes the century (0–4 → 1900s, 5–8 → 2000s, 9 → 1800s). PHP's `checkdate()` verifies that the resulting date is a real calendar date.
+
+The checksum digit (position 10) is intentionally not validated because no publicly verified algorithm exists for it; the structure and birth-date checks are sufficient to reject the vast majority of typographical errors at a self-service terminal.

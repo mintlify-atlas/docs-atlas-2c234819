@@ -1,0 +1,80 @@
+---
+title: "Audit Log: Tracking All System Actions"
+description: "Every SGR-Turnos action — logins, turn creation, cancellations, config changes — is recorded in an append-only audit log with HMAC-anonymized IP addresses."
+---
+
+Every state-changing operation in SGR-Turnos writes a record to the `auditoria` table. This includes user authentication events, turn lifecycle changes (creation, update, cancellation, marking as used), daily configuration operations, and user account management. The audit log is the definitive record of who did what and when across the entire system, and it is accessible to Admin and Super Admin roles at `/admin/auditoria`.
+
+## The `Auditoria` Entity
+
+Each audit record is an instance of `App\Entity\Auditoria` persisted by `AuditoriaService`. The entity stores the following fields:
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | `bigint` (unsigned) | Auto-incremented primary key. `bigint` is used because audit tables grow quickly in high-traffic environments. |
+| `usuario` | `ManyToOne → Usuario` (nullable) | The authenticated user who performed the action. `null` indicates a system-initiated event (shown as "Sistema" in the UI). |
+| `tipo_accion` | `string(50)` | The type of action performed. Examples seen in the codebase: `CREATE`, `UPDATE`, `DELETE`, `LOGIN`, `LOGOUT`, `ACTIVAR`, `DESACTIVAR`, `TURNO_MARCADO_USADO`, `CONFIGURACION_CREADA`. |
+| `entidad_afectada` | `string(50)` (nullable) | The class name of the entity that was changed: `Turno`, `Usuario`, `Servicio`, `ConfiguracionDiaria`, etc. |
+| `entidad_id` | `integer` (nullable) | The primary key of the affected entity, enabling precise lookup of the record that changed. |
+| `datos_antes` | `json` (nullable) | A JSON snapshot of the entity's relevant fields **before** the change. `null` for create operations where no prior state exists. |
+| `datos_despues` | `json` (nullable) | A JSON snapshot of the entity's relevant fields **after** the change. `null` for delete operations. |
+| `ip_origen` | `string(64)` (nullable) | The **anonymized** IP address of the client that triggered the action (see IP anonymization below). |
+| `user_agent` | `string(255)` (nullable) | The raw `User-Agent` header from the HTTP request, capturing browser and client information. |
+| `creado_en` | `datetime` | Timestamp when the record was created. Set automatically in `Auditoria::__construct()`. |
+
+### Before/After JSON Snapshots
+
+For `UPDATE` operations, both `datos_antes` and `datos_despues` are populated, making it possible to diff what changed. For example, when a user's role is changed, `datos_antes` contains `{"rol": "ROLE_OPERADOR"}` and `datos_despues` contains `{"rol": "ROLE_ADMIN"}`. If a password was changed during an update, `datos_despues` includes `{"passwordChanged": true}` — the actual hash is never logged.
+
+For `CREATE` operations, `datos_antes` is `null` and `datos_despues` contains the initial field values. For `DELETE` operations, `datos_antes` contains the final state of the record and `datos_despues` is `null`.
+
+## How Records Are Written
+
+All controllers that modify data inject `AuditoriaService` (via the `AuditoriaInterface`) and call `registrar()` after a successful database operation:
+
+```php
+$this->auditoriaService->registrar(
+    'UPDATE',        // tipo_accion
+    'Usuario',       // entidad_afectada
+    $usuario->getId(), // entidad_id
+    $datosAntes,     // datos_antes (array, serialized to JSON)
+    $datosDespues    // datos_despues (array, serialized to JSON)
+);
+```
+
+`AuditoriaService::registrar()` resolves the current authenticated user from Symfony's `Security` component, reads the client IP and `User-Agent` from the current request via `RequestStack`, anonymizes the IP, and delegates persistence to `AuditoriaStorageInterface`. The service is designed around interfaces (`AuditoriaInterface`, `IpAnonymizerInterface`, `AuditoriaStorageInterface`) so storage and anonymization strategies can be swapped without changing callers.
+
+## IP Anonymization
+
+SGR-Turnos never stores raw IP addresses. Before persisting `ip_origen`, the system applies two transformations:
+
+1. **SHA-256 hashing** of the raw IP string.
+2. **Subnet masking** to remove host-level precision.
+
+The result is a fixed-length string (stored in `string(64)`) that cannot be reversed to recover the original IP address. This design means audit records can identify patterns — such as multiple failed logins from the same subnet — without retaining personally identifiable network data.
+
+<Warning>
+  Because IP addresses are anonymized before storage, it is not possible to recover the original client IP from the audit log after the fact. Correlate audit records with web server access logs (Apache/Nginx) if you need the raw IP for a specific event, as long as those logs are retained separately.
+</Warning>
+
+## Browsing the Audit Log at `/admin/auditoria`
+
+The audit log view (`AuditoriaController`) is paginated at 15 records per page, sorted descending by `creado_en` (most recent first). Four filters are available:
+
+- **Usuario** — filter by the user who performed the action (dropdown, populated from all users).
+- **Tipo de Acción** — filter by action type (dropdown, populated from the distinct `tipo_accion` values present in the database).
+- **Desde / Hasta** — date range filter. Both dates are validated strictly against the `Y-m-d` format on the server; invalid formats are ignored with a warning flash message rather than causing an error.
+
+The table columns visible in the UI are: date/time, user, action type badge, entity description (e.g. `Usuario #12`), and the anonymized IP. Hovering over the entity description row shows a tooltip with the `datos_despues` JSON, rendered via the `mdi:information` icon.
+
+<Tip>
+  Use the audit log to investigate suspicious patterns. Filter by `tipo_accion = LOGIN` for a specific date range to identify repeated failed or successful login attempts. Filter by `entidad_afectada = Usuario` and `tipo_accion = DELETE` to trace who removed an account and when. Combining the `datos_antes` / `datos_despues` JSON with the timestamp gives a complete picture of any configuration drift.
+</Tip>
+
+## Append-Only Design
+
+There is no route in the application for editing or deleting audit records. `AuditoriaController` exposes only a single `GET /admin/auditoria` route. Records are written once by `AuditoriaService` and are never modified. This means the audit log can be trusted as an authoritative, tamper-evident history of system activity — provided the database itself is appropriately access-controlled.
+
+<Note>
+  System-initiated events (such as automatic turn expiration or background processes) are recorded with `usuario = null`. These appear in the UI with a robot icon and the label "Sistema", distinguishing them from actions taken by a logged-in user.
+</Note>

@@ -1,0 +1,106 @@
+{
+  "projectType": "saas",
+  "projectName": "SGR-Turnos",
+  "projectDescription": "A web-based bank branch queue management system that replaces physical lines with virtual appointment reservations, enforcing identity-linked turn assignment and configurable withdrawal frequency controls.",
+  "theme": "almond",
+  "primaryColor": "#848c8e",
+  "lightColor": "#11161e",
+  "darkColor": "#cfd0d2",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "installation",
+              "configuration"
+            ]
+          },
+          {
+            "group": "Core Features",
+            "pages": [
+              "features/public-registration",
+              "features/admin-backoffice",
+              "features/service-management",
+              "features/daily-calendar",
+              "features/turn-lifecycle"
+            ]
+          },
+          {
+            "group": "Administration",
+            "pages": [
+              "admin/user-roles",
+              "admin/audit-log",
+              "admin/reports-export"
+            ]
+          },
+          {
+            "group": "Security",
+            "pages": [
+              "security/overview",
+              "security/anti-scalping",
+              "security/concurrency"
+            ]
+          },
+          {
+            "group": "Deployment",
+            "pages": [
+              "deployment/requirements",
+              "deployment/docker",
+              "deployment/console-commands"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Reference",
+        "groups": [
+          {
+            "group": "Data Model",
+            "pages": [
+              "reference/entities",
+              "reference/enums"
+            ]
+          },
+          {
+            "group": "Architecture",
+            "pages": [
+              "reference/architecture",
+              "reference/services"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Identity-linked turn reservation using Cuban CI validation",
+    "Configurable frequency control (anti-scalping) with automatic blocking periods",
+    "Daily configuration calendar with per-service monto, limits and ticket quota",
+    "Hierarchical role system: Super Admin, Admin, Supervisor, Operator",
+    "Full audit trail with IP anonymization (SHA-256 + mask)",
+    "Printable official turn list and Excel export for custodians",
+    "Optimistic and pessimistic locking for concurrent turn assignment",
+    "Operates fully offline on local network (LAN)",
+    "Rate limiting on public CI entry and reservation endpoints",
+    "CSRF protection and bcrypt/argon2 password hashing"
+  ],
+  "publicApiSurface": [
+    "GET /ingreso — Public CI entry form",
+    "POST /ingreso/procesar — Process CI and start session",
+    "GET /seleccionar-servicio — Service and date selection",
+    "POST /cliente-datos — Submit client data and confirm reservation",
+    "GET /admin/dashboard — Admin dashboard",
+    "GET /admin/servicios — Service management",
+    "GET /admin/calendario — Daily configuration calendar",
+    "GET /admin/turnos/hoy — Today's turn list with mark-as-used",
+    "GET /admin/usuarios — User management",
+    "GET /admin/auditoria — Audit log",
+    "php bin/console app:create-super-admin",
+    "php bin/console app:load-roles",
+    "php bin/console app:backup-database"
+  ]
+}

@@ -1,0 +1,127 @@
+---
+title: "Install SGR-Turnos on Your Server"
+description: "Step-by-step guide to installing SGR-Turnos with PHP 8.4, MySQL 8.0, Composer, and a web server. Includes database setup and initial user creation."
+---
+
+This guide walks you through installing SGR-Turnos on a Linux server (or any machine running Apache or Nginx). The process takes roughly 15 minutes on a clean server once all requirements are met. The application is designed to run on a local area network inside the branch — no internet access is needed after installation.
+
+<Note>
+  SGR-Turnos operates fully offline on LAN after setup. Once installed, the branch server does not need an internet connection to serve the registration terminal or the admin backoffice.
+</Note>
+
+## Requirements
+
+Before you begin, ensure the server meets the following requirements:
+
+| Requirement | Minimum version | Notes |
+|---|---|---|
+| **PHP** | 8.4 | Extensions required: `pdo_mysql`, `intl`, `mbstring`, `ctype`, `json`, `bcmath` |
+| **MySQL** | 8.0 | MariaDB 10.5+ is also supported |
+| **Composer** | 2.x | Used to install PHP dependencies |
+| **Web server** | Apache or Nginx | URL rewriting must be enabled |
+| **Node.js + npm** | Any LTS | Optional — only needed if you want to modify CSS styles |
+
+## Installation Steps
+
+<Steps>
+  <Step title="Clone the repository">
+    Download the source code and enter the project directory:
+
+    ```bash
+    git clone https://github.com/Christianrvdv/SGR-Turnos.git && cd SGR-Turnos
+    ```
+  </Step>
+
+  <Step title="Install PHP dependencies">
+    Use Composer to install all required packages:
+
+    ```bash
+    composer install
+    ```
+
+    Composer will also run post-install scripts that clear the cache, install web assets, and set up the importmap.
+  </Step>
+
+  <Step title="Configure the environment">
+    Copy the template environment file and set your local values:
+
+    ```bash
+    cp .env .env.local
+    ```
+
+    Open `.env.local` in a text editor and set at minimum these two variables:
+
+    ```dotenv
+    DATABASE_URL="mysql://user:password@127.0.0.1:3306/sgr_turnos"
+    APP_SECRET=your-random-secret-string-here
+    ```
+
+    Replace `user`, `password`, and `sgr_turnos` with the credentials and database name for your MySQL server. See the [Configuration guide](/configuration) for a full explanation of each variable.
+  </Step>
+
+  <Step title="Create the database and run migrations">
+    Create the database schema and apply all migrations:
+
+    ```bash
+    php bin/console doctrine:database:create
+    php bin/console doctrine:migrations:migrate
+    ```
+
+    Confirm the migration prompt with `yes` when asked.
+  </Step>
+
+  <Step title="Load predefined roles">
+    Populate the roles table with the five built-in roles (Super Admin, Admin, Supervisor, Operator, and Basic Operator):
+
+    ```bash
+    php bin/console app:load-roles
+    ```
+  </Step>
+
+  <Step title="Create the Super Admin user">
+    Run the interactive command to create the first administrator account:
+
+    ```bash
+    php bin/console app:create-super-admin
+    ```
+
+    The command will prompt you for a username, email address, full name, and password. This account has full access to all system functions.
+  </Step>
+
+  <Step title="Configure the web server document root">
+    Point your Apache virtual host or Nginx server block to the `public/` directory inside the project. This is the only publicly accessible folder — the rest of the application must remain outside the web root.
+
+    **Apache example (`VirtualHost` block):**
+
+    ```apache
+    DocumentRoot /var/www/sgr-turnos/public
+    <Directory /var/www/sgr-turnos/public>
+        AllowOverride All
+        Require all granted
+    </Directory>
+    ```
+
+    **Nginx example:**
+
+    ```nginx
+    root /var/www/sgr-turnos/public;
+    index index.php;
+
+    location / {
+        try_files $uri /index.php$is_args$args;
+    }
+    ```
+
+    Make sure URL rewriting is enabled (`mod_rewrite` on Apache; `try_files` directive on Nginx).
+  </Step>
+
+  <Step title="(Optional) Compile CSS assets">
+    If you need to modify the Tailwind CSS styles, install Node.js dependencies and build the assets:
+
+    ```bash
+    npm install && npm run build
+    ```
+
+    For production deployments without CSS changes, the pre-built assets included in the repository are sufficient.
+  </Step>
+</Steps>

@@ -1,0 +1,451 @@
+---
+title: "Service Layer Reference: Business Logic Interfaces"
+description: "PHP interface contracts for SGR-Turnos business logic: auditing, client lookup, daily configuration, dashboard stats, frequency blocking, and IP anonymization."
+---
+
+All business logic in SGR-Turnos lives in the `src/Service/` namespace. Each service is defined by a PHP interface and implemented by a concrete class. Symfony's autowiring maps the interface to its implementation automatically, so controllers and commands depend only on the interface contract. This page documents each interface, its methods, and the responsibilities of the concrete implementation.
+
+<Note>
+  When adding a new service, follow the project convention: create the interface first, implement it in a separate class, and wire the binding in `config/services.yaml` if autowiring cannot resolve it automatically.
+</Note>
+
+---
+
+## AuditoriaInterface
+
+**Concrete implementation:** `App\Service\AuditoriaService`
+
+`AuditoriaInterface` defines the contract for recording audit events. Every significant state change in the system — turn creation, cancellation, login, configuration update — calls `registrar()`. The concrete `AuditoriaService` resolves the current authenticated user from the Symfony security context, anonymises the client IP via `IpAnonymizerInterface`, and delegates persistence to an injected `AuditoriaStorageInterface`.
+
+```php
+<?php
+
+namespace App\Service;
+
+interface AuditoriaInterface
+{
+    public function registrar(
+        string $tipoAccion,
+        string $entidadAfectada,
+        ?int   $entidadId = null,
+        ?array $datosAntes = null,
+        ?array $datosDespues = null
+    ): void;
+}
+```
+
+### Method: `registrar()`
+
+<ResponseField name="tipoAccion" type="string" required>
+  Short action code identifying what occurred, e.g. `CREAR_TURNO`, `CANCELAR_TURNO`, `LOGIN`, `CERRAR_CONFIGURACION`. Free-form string; the column is `VARCHAR(50)`.
+</ResponseField>
+
+<ResponseField name="entidadAfectada" type="string" required>
+  Class name or table identifier of the entity that changed, e.g. `Turno`, `ConfiguracionDiaria`. Stored in `auditoria.entidad_afectada`.
+</ResponseField>
+
+<ResponseField name="entidadId" type="int|null">
+  Primary key of the affected row. Pass `null` for actions that do not target a single record (e.g. bulk expiry).
+</ResponseField>
+
+<ResponseField name="datosAntes" type="array|null">
+  Associative array snapshot of the entity state **before** the change. Pass `null` for creation events.
+</ResponseField>
+
+<ResponseField name="datosDespues" type="array|null">
+  Associative array snapshot of the entity state **after** the change. Pass `null` for deletion events.
+</ResponseField>
+
+**Implementation notes:**
+
+```php
+// AuditoriaService resolves the user, anonymises the IP, then calls storage
+$auditoria->setIpOrigen($this->ipAnonymizer->anonymize($request->getClientIp()));
+$auditoria->setUserAgent($request->headers->get('User-Agent'));
+$this->storage->guardar($auditoria);
+```
+
+<Warning>
+  `AuditoriaService` depends on `AuditoriaStorageInterface` (not shown in the public interface list) for the actual `EntityManager` interaction. This indirection keeps the service testable without a real database connection.
+</Warning>
+
+---
+
+## ClienteInterface
+
+**Concrete implementation:** `App\Service\ClienteManager`
+
+`ClienteInterface` abstracts client lookup and creation behind a single method. The registration terminal calls this method before any turn is reserved, ensuring that a `Cliente` record always exists for the given identity number before the turn assignment transaction begins.
+
+```php
+<?php
+
+namespace App\Service;
+
+use App\Entity\Cliente;
+
+interface ClienteInterface
+{
+    public function obtenerOCrearPorIdentidad(string $numeroIdentidad): Cliente;
+}
+```
+
+### Method: `obtenerOCrearPorIdentidad()`
+
+<ResponseField name="numeroIdentidad" type="string" required>
+  The Cuban national identity number (CI) validated upstream by the controller. The method performs a `findOneBy(['numeroIdentidad' => $numeroIdentidad])` lookup; if no record exists it creates and persists a minimal `Cliente` with only this field set.
+</ResponseField>
+
+**Returns:** `Cliente` — either the existing entity or the newly created and flushed one.
+
+**Implementation detail:**
+
+```php
+public function obtenerOCrearPorIdentidad(string $numeroIdentidad): Cliente
+{
+    $cliente = $this->clienteRepository->findOneBy(['numeroIdentidad' => $numeroIdentidad]);
+
+    if (!$cliente) {
+        $cliente = new Cliente();
+        $cliente->setNumeroIdentidad($numeroIdentidad);
+        $this->entityManager->persist($cliente);
+        $this->entityManager->flush();
+    }
+
+    return $cliente;
+}
+```
+
+<Tip>
+  Because `obtenerOCrearPorIdentidad()` calls `flush()` immediately, the returned `Cliente` always has a non-null `id` that can be used as a foreign key in the subsequent turn creation transaction.
+</Tip>
+
+---
+
+## ConfiguracionDiariaInterface
+
+**Concrete implementation:** `App\Service\ConfiguracionDiariaManager`
+
+`ConfiguracionDiariaInterface` encapsulates the two core operations for managing daily service configurations: computing available ticket count from financial parameters, and persisting a create-or-update configuration record.
+
+```php
+<?php
+
+namespace App\Service;
+
+use App\DTO\ConfiguracionDiariaDTO;
+use App\Entity\ConfiguracionDiaria;
+use App\Entity\Servicio;
+use App\Entity\Usuario;
+
+interface ConfiguracionDiariaInterface
+{
+    /**
+     * Calculates ticket count with exact decimal precision using BCMath.
+     *
+     * @throws \InvalidArgumentException if limitePorPersona <= 0
+     */
+    public function calcularTickets(
+        string $montoCargado,
+        string $limitePorPersona,
+        string $porcentajeReserva
+    ): int;
+
+    /**
+     * Creates or updates a daily configuration.
+     *
+     * @return ConfiguracionDiaria The persisted entity (after flush).
+     */
+    public function crearOActualizar(
+        Servicio               $servicio,
+        \DateTimeInterface     $fecha,
+        ConfiguracionDiariaDTO $dto,
+        Usuario                $usuario
+    ): ConfiguracionDiaria;
+}
+```
+
+### Method: `calcularTickets()`
+
+<ResponseField name="montoCargado" type="string" required>
+  Total cash amount for the day as a BCMath-compatible decimal string (e.g. `"50000.00"`).
+</ResponseField>
+
+<ResponseField name="limitePorPersona" type="string" required>
+  Per-person withdrawal limit. Must be greater than zero; the method throws `\InvalidArgumentException` otherwise.
+</ResponseField>
+
+<ResponseField name="porcentajeReserva" type="string" required>
+  Percentage of `montoCargado` reserved and not distributed as tickets. `"0.00"` means all cash is available.
+</ResponseField>
+
+**Returns:** `int` — `floor(montoCargado * (1 - porcentajeReserva/100) / limitePorPersona)`, minimum `0`.
+
+**Formula implemented with BCMath for exact precision:**
+
+```php
+$factor         = bcdiv(bcsub('100', $porcentajeReserva, 4), '100', 4);
+$montoDisponible = bcmul($montoCargado, $factor, 4);
+$division       = bcdiv($montoDisponible, $limitePorPersona, 4);
+$tickets        = (int) floor((float) $division);
+return max(0, $tickets);
+```
+
+### Method: `crearOActualizar()`
+
+<ResponseField name="servicio" type="Servicio" required>
+  The service entity for which the configuration applies.
+</ResponseField>
+
+<ResponseField name="fecha" type="\DateTimeInterface" required>
+  The calendar date. Combined with `servicio`, it forms the unique key `(servicio_id, fecha)`.
+</ResponseField>
+
+<ResponseField name="dto" type="ConfiguracionDiariaDTO" required>
+  Carries `montoCargado`, `limitePorPersona`, `porcentajeReserva`, and `estado`. Built from validated form data in the controller.
+</ResponseField>
+
+<ResponseField name="usuario" type="Usuario" required>
+  The authenticated user creating or updating the configuration. Stored in `creado_por` for new records.
+</ResponseField>
+
+**Returns:** `ConfiguracionDiaria` — the persisted entity with `id` populated.
+
+<Warning>
+  When updating an existing configuration, `crearOActualizar()` computes `ticketsUsados = ticketsGenerados - ticketsRestantes` and throws `\InvalidArgumentException` if the new total would be less than the already-assigned tickets. This prevents overselling.
+</Warning>
+
+---
+
+## DashboardInterface
+
+**Concrete implementation:** `App\Service\DashboardService`
+
+`DashboardInterface` provides a single aggregation method that collects all data needed to render the administration dashboard for a given date. It queries active services, their open configurations, and pending turn counts.
+
+```php
+<?php
+
+namespace App\Service;
+
+interface DashboardInterface
+{
+    public function getDashboardData(\DateTimeInterface $fecha = null): array;
+}
+```
+
+### Method: `getDashboardData()`
+
+<ResponseField name="fecha" type="\DateTimeInterface|null">
+  The date to aggregate data for. Defaults to `new \DateTime('today')` when `null`.
+</ResponseField>
+
+**Returns:** `array` with the following keys:
+
+| Key | Type | Description |
+|---|---|---|
+| `fecha` | `\DateTimeInterface` | The resolved date used for the query. |
+| `totalPendientesHoy` | `int` | Sum of `RESERVADO` turns across all active services for this date. |
+| `totalTicketsDisponibles` | `int` | Sum of `tickets_restantes` from all open `ConfiguracionDiaria` records for this date. |
+| `servicios` | `array` | Per-service breakdown: `id`, `nombre`, `codigo`, `ticketsRestantes`, `turnosPendientes`. |
+| `semana` | `int` | ISO week number (`date('W')`). |
+| `diaSemana` | `string` | Day name in Spanish (e.g. `Lunes`, `Martes`). |
+
+**Implementation note:** `DashboardService` iterates all active services and calls `ConfiguracionDiariaRepository::findActivaByServicioYFecha()` per service. For large numbers of services this produces N+1 queries; a future optimisation could batch the lookup.
+
+---
+
+## FrecuenciaInterface
+
+**Concrete implementation:** `App\Service\FrecuenciaService`
+
+`FrecuenciaInterface` encapsulates the anti-colero frequency-blocking logic. When `Servicio::$requiereControlFrecuencia` is `true`, this service determines whether a client is currently within the post-use blocking window and, if so, the earliest date they may reserve again.
+
+```php
+<?php
+
+namespace App\Service;
+
+use App\Entity\Cliente;
+use App\Entity\Servicio;
+use App\Entity\Turno;
+
+interface FrecuenciaInterface
+{
+    /**
+     * Returns the client's most recent USADO or RESERVADO turn for a service.
+     */
+    public function getUltimoTurno(Cliente $cliente, Servicio $servicio): ?Turno;
+
+    /**
+     * Returns the date from which the client may reserve again, or null if not blocked.
+     */
+    public function getFechaDesbloqueo(Cliente $cliente, Servicio $servicio): ?\DateTimeInterface;
+
+    /**
+     * Returns true if the client may take a turn on the given date.
+     */
+    public function puedeTomarTurno(
+        Cliente             $cliente,
+        Servicio            $servicio,
+        ?\DateTimeInterface $fechaDeseada = null
+    ): bool;
+
+    /**
+     * Returns blocking status for multiple services in a single call.
+     *
+     * @return array<int, array{servicio: Servicio, bloqueado: bool, fechaDesbloqueo: ?\DateTimeInterface}>
+     */
+    public function getBloqueosPorCliente(Cliente $cliente, array $servicios): array;
+}
+```
+
+### Method: `getUltimoTurno()`
+
+Delegates to `TurnoRepository::findUltimoTurnoReservadoOUsado()`. Returns the most recent `Turno` with state `USADO` or `RESERVADO` for the given client/service pair, or `null` if none exists.
+
+### Method: `getFechaDesbloqueo()`
+
+Computes the unlock date as `fechaTurno + diasBloqueo days`. Returns `null` if the client has no qualifying turn, or if the computed unlock date is in the past (meaning the block has already lifted).
+
+```php
+$fechaTurno     = $ultimoTurno->getConfiguracionDiaria()->getFecha();
+$diasBloqueo    = $servicio->getDiasBloqueo() ?? 0;
+$fechaDesbloqueo = (clone $fechaTurno)->modify("+{$diasBloqueo} days");
+$hoy            = new \DateTime('today');
+return $fechaDesbloqueo > $hoy ? $fechaDesbloqueo : null;
+```
+
+### Method: `puedeTomarTurno()`
+
+<ResponseField name="cliente" type="Cliente" required>
+  The client to check.
+</ResponseField>
+
+<ResponseField name="servicio" type="Servicio" required>
+  The service to check against.
+</ResponseField>
+
+<ResponseField name="fechaDeseada" type="\DateTimeInterface|null">
+  The date for which the client wants a turn. Defaults to today.
+</ResponseField>
+
+**Returns:** `true` if `fechaDeseada >= fechaDesbloqueo` (or no block exists); `false` if the client is currently blocked.
+
+### Method: `getBloqueosPorCliente()`
+
+Accepts an array of `Servicio` entities and returns a map keyed by `servicio->getId()`. Each entry contains:
+
+- `servicio` — the `Servicio` entity
+- `bloqueado` — `true` if a non-null `fechaDesbloqueo` exists
+- `fechaDesbloqueo` — the unlock `\DateTimeInterface`, or `null` if not blocked
+
+This bulk method powers the service-selection screen, which must show the lock status for every available service in a single page load.
+
+---
+
+## IpAnonymizerInterface
+
+**Concrete implementation:** `App\Service\IpAnonymizerService`
+
+`IpAnonymizerInterface` abstracts IP anonymisation so that raw IP addresses are never persisted to the `auditoria` or `turno` tables. Two strategies are offered: full cryptographic hashing and lightweight partial masking.
+
+```php
+<?php
+
+namespace App\Service;
+
+interface IpAnonymizerInterface
+{
+    public function anonymize(?string $ip): ?string;
+
+    /**
+     * Lighter alternative: zero the last octet.
+     * Example: 192.168.1.100 → 192.168.1.0
+     */
+    public function anonymizePartial(?string $ip): ?string;
+}
+```
+
+### Method: `anonymize()`
+
+<ResponseField name="ip" type="string|null" required>
+  Raw IP address string. Returns `null` immediately if the input is `null`.
+</ResponseField>
+
+**Returns:** HMAC-SHA256 hex digest of the IP, keyed on `APP_SECRET`. The output is always 64 hexadecimal characters, fitting comfortably in `auditoria.ip_origen VARCHAR(64)`.
+
+```php
+public function anonymize(?string $ip): ?string
+{
+    if ($ip === null) {
+        return null;
+    }
+    return hash_hmac('sha256', $ip, $this->secret);
+}
+```
+
+<Warning>
+  Because the same `APP_SECRET` is used across all calls, two identical IPs will produce identical hashes. If someone obtains `APP_SECRET` they can reverse-lookup any IP by brute force. Rotate `APP_SECRET` periodically and keep it out of version control.
+</Warning>
+
+### Method: `anonymizePartial()`
+
+A lighter alternative that removes the last identifying octet without hashing. Useful when some geographic granularity is acceptable and reversibility is not a concern.
+
+- **IPv4:** replaces the fourth octet with `0`. Example: `192.168.1.100` → `192.168.1.0`
+- **IPv6:** retains only the first four groups (64 bits) and appends `::`. Example: `2001:db8:85a3:0:...` → `2001:db8:85a3:0::`
+- **Unknown format:** falls back to `anonymize()` (full hash).
+
+```php
+public function anonymizePartial(?string $ip): ?string
+{
+    if ($ip === null) {
+        return null;
+    }
+
+    // IPv4
+    if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+        $parts    = explode('.', $ip);
+        $parts[3] = '0';
+        return implode('.', $parts);
+    }
+
+    // IPv6 — keep first 64 bits
+    if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) {
+        $parts = array_slice(explode(':', $ip), 0, 4);
+        return implode(':', $parts) . '::';
+    }
+
+    return $this->anonymize($ip);
+}
+```
+
+<Tip>
+  `AuditoriaService` calls `anonymize()` (full hash) by default. Switch to `anonymizePartial()` if your compliance requirements allow partial masking and you need the output to be human-readable during incident investigations.
+</Tip>
+
+---
+
+## Service Dependency Summary
+
+<CardGroup cols={2}>
+  <Card title="AuditoriaService" icon="shield-check">
+    Depends on: `Security`, `RequestStack`, `IpAnonymizerInterface`, `AuditoriaStorageInterface`
+  </Card>
+  <Card title="ClienteManager" icon="user">
+    Depends on: `ClienteRepository`, `EntityManagerInterface`
+  </Card>
+  <Card title="ConfiguracionDiariaManager" icon="calendar">
+    Depends on: `ConfiguracionDiariaRepository`, `EntityManagerInterface`
+  </Card>
+  <Card title="DashboardService" icon="chart-bar">
+    Depends on: `ConfiguracionDiariaRepository`, `TurnoRepository`, `ServicioRepository`
+  </Card>
+  <Card title="FrecuenciaService" icon="clock">
+    Depends on: `TurnoRepository`
+  </Card>
+  <Card title="IpAnonymizerService" icon="eye-slash">
+    Depends on: `string $appSecret` (bound from `%env(APP_SECRET)%` in `services.yaml`)
+  </Card>
+</CardGroup>

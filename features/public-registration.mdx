@@ -1,0 +1,111 @@
+---
+title: "Client Turn Registration at the Public Terminal"
+description: "How bank customers use the SGR-Turnos public terminal to enter their identity card, select a service and date, and receive a printed numbered turn ticket."
+---
+
+The public registration module is the entry point for every bank customer. It runs on a dedicated branch terminal — a PC or tablet connected to the local network — and requires no internet access. The client interacts with a full-screen numeric keypad to enter their Cuban identity card (Carnet de Identidad, CI), after which the system validates their identity, checks for any active frequency block, and guides them to select a service, fill in their personal details, and confirm a numbered turn. The session ends when the turn ticket is rendered on screen and printed.
+
+<Note>
+  Rate limiting is enforced on every IP address that submits the CI entry form. Too many failed or rapid attempts cause the IP to be temporarily blocked with an HTTP 429 response. The retry window is calculated from `RateLimiterFactory::limiter_ingreso_ci`. A separate limiter (`limiter_reserva_turno`) also applies at the final turn confirmation step.
+</Note>
+
+## Full Client Journey
+
+<Steps>
+  ### Navigate to `/ingreso`
+
+  The terminal opens `/ingreso`, which renders `templates/ingreso/index.html.twig`. The page shows a large on-screen numeric keypad and a read-only input field. The client enters their 11-digit CI using the virtual buttons or a physical keyboard. The input is limited to 11 characters on the client side as a UX hint, but authoritative validation happens on the server.
+
+  ### Submit the CI — `POST /ingreso/procesar`
+
+  Pressing **Continuar** submits the form to `POST /ingreso/procesar`, handled by `IngresoController::procesar()`. The controller:
+
+  1. Applies the `limiter_ingreso_ci` rate limiter for the client IP. If the limit is exceeded, a `TooManyRequestsHttpException` is thrown.
+  2. Strips all non-digit characters from the submitted value with `preg_replace('/[^0-9]/', '', $ci)`.
+  3. Calls the private `validarCI()` method (see below).
+  4. Looks up or creates a `Cliente` record via `ClienteInterface::obtenerOCrearPorIdentidad($ci)`.
+  5. Stores the resulting `cliente_id` in the PHP session: `$request->getSession()->set('cliente_id', $cliente->getId())`.
+  6. Redirects to `app_seleccionar_servicio`.
+
+  ### CI Validation Rules
+
+  `IngresoController::validarCI()` applies the following checks in order:
+
+  | Check | Rule |
+  |---|---|
+  | Length | Exactly 11 digits; any other length is rejected. |
+  | Year digits | Positions 0–1 (YY) and century digit at position 6. |
+  | Century digit | `0–4` → year is `1900 + YY`; `5–8` → year is `2000 + YY`; `9` → year is `1800 + YY`. Any other digit returns an error. |
+  | Birth date | Positions 2–3 are the month (MM) and 4–5 are the day (DD). PHP's `checkdate($mes, $dia, $anioCompleto)` must return `true`. |
+  | Check digit | The official Cuban CI check-digit algorithm is **intentionally omitted** because no publicly reliable algorithm exists. Structure and birth-date validation is considered sufficient for a self-service terminal. |
+
+  If any check fails, a flash error is added and the user is redirected back to `/ingreso`.
+
+  ### Service and Date Selection — `GET /seleccionar-servicio`
+
+  On a valid CI, the controller redirects to `app_seleccionar_servicio`. `PublicTurnoController::seleccionarServicio()` immediately redirects to `app_seleccionar_fecha` for the first available active service. The routing then branches depending on the service's configuration flags:
+
+  - **`configuracion_diaria = true`** — the client is shown a monthly calendar (`/seleccionar-fecha/{servicioId}`) that displays only days where a `ConfiguracionDiaria` record exists with `estado = ABIERTA` and `tickets_restantes > 0`. Dates before the client's frequency unblock date are filtered out.
+  - **`configuracion_diaria = false`, `listado_unico = false`** — a simplified calendar (`/calendario-simple/{servicioId}`) is shown. Days are enabled if they are today or in the future, and either no configuration exists but `tickets_por_dia > 0`, or an existing configuration still has remaining tickets.
+  - **`configuracion_diaria = false`, `listado_unico = true`** — the client is sent directly to the data entry form without date selection.
+
+  If the selected service has `requiere_control_frecuencia = true` and the client has a recent used turn for that service, `FrecuenciaService::getBloqueosPorCliente()` returns the unlock date. The calendar automatically hides dates before that date, and if all services are blocked a flash warning is shown.
+
+  ### Enter Personal Details — `/cliente-datos/{servicioId}/{fecha}`
+
+  The client fills in their name, phone number, and e-mail address. For services with `listado_unico = true` (i.e. `configuracion_diaria = false` AND `listadoUnico = true`), a **withdrawal amount** field is also required and must be a positive number greater than zero. The `nombre_completo` field is mandatory in all cases.
+
+  The form is protected by a CSRF token (`cliente_datos`). On submission (`POST /cliente-datos/procesar/{servicioId}/{fecha}`), the controller:
+
+  1. Validates the CSRF token.
+  2. Validates `nombre_completo` is not empty.
+  3. Validates `monto` if the service is `listadoUnico`.
+  4. Calls `FrecuenciaService::puedeTomarTurno()` as a final frequency check.
+  5. Updates the `Cliente` entity with the submitted data.
+
+  ### Confirm the Turn — `/confirmar-turno/{configId}`
+
+  For services with `configuracion_diaria = true`, after the data form the client is redirected to a confirmation page (`confirmar_turno.html.twig`) which shows the date, service, and allowed withdrawal amount. At this point no turn has been committed yet.
+
+  Pressing **Confirm** submits `POST /procesar-turno/{configId}`. The controller:
+
+  1. Re-applies the `limiter_reserva_turno` rate limiter.
+  2. Validates the CSRF token (`confirmar_turno`).
+  3. Re-checks `FrecuenciaService::puedeTomarTurno()` and `tickets_restantes > 0`.
+  4. Executes the turn creation inside a **retryable optimistic-lock transaction** (`RetryableTransactionTrait::executeWithRetry()`). Within the transaction, `getNextNumeroTurnoWithLock()` fetches the next sequential turn number using a pessimistic `FOR UPDATE` lock, the `ConfiguracionDiaria::decrementarTicketsRestantes(1)` method atomically decrements the counter, and the new `Turno` entity is persisted.
+  5. Records an audit entry via `AuditoriaService`.
+  6. Removes `cliente_id` from the session.
+
+  For `listadoUnico` services the turn is created directly in `procesarClienteDatos()` without a separate confirmation page, using `getNextNumeroTurnoByServicioYFecha()`.
+
+  ### Receive the Ticket — `/turno-confirmado?turnoId={id}`
+
+  The final page renders `public/turno_confirmado.html.twig` with the `Turno` entity. The ticket displays the unique `numero_turno`, the service name, the date, and the allowed withdrawal amount. CSS `@media print` styles optimise the layout for an attached matrix or laser printer. The session key `cliente_id` is cleared at this point, resetting the terminal for the next customer.
+</Steps>
+
+## Session Flow Summary
+
+```
+/ingreso (GET)
+  └─ POST /ingreso/procesar
+        ├─ CI invalid → redirect /ingreso  (flash error)
+        └─ CI valid   → session[cliente_id] set
+                         redirect /seleccionar-servicio
+                              └─ redirect /seleccionar-fecha/{servicioId}  (or /calendario-simple / /cliente-datos)
+                                    └─ /cliente-datos/{servicioId}/{fecha}
+                                          └─ POST /cliente-datos/procesar/{servicioId}/{fecha}
+                                                ├─ config_diaria=true → redirect /confirmar-turno/{configId}
+                                                │        └─ POST /procesar-turno/{configId}
+                                                │                 └─ redirect /turno-confirmado?turnoId={id}
+                                                └─ listado_unico=true → redirect /turno-confirmado?turnoId={id}
+```
+
+## Frequency Block Behaviour
+
+When a client's last turn for a service has `estado = USADO`, `FrecuenciaService` computes the unblock date as:
+
+```
+unblock_date = last_turn_config.fecha + servicio.dias_bloqueo days
+```
+
+If `unblock_date > today`, the client is considered blocked for that service. The date is surfaced in the calendar view. On the service selection page, if all services are blocked, the user sees: _"No puedes solicitar turno en ningún servicio porque tienes turnos activos o recientes."_

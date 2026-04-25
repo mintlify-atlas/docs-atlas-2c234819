@@ -1,0 +1,70 @@
+---
+title: "Daily Calendar: Configure Per-Day Quotas and Amounts"
+description: "Use the SGR-Turnos daily calendar to define the cash loaded, per-person limit, and available ticket quota for each service on each operating day."
+---
+
+The **daily calendar** is the mechanism by which branch administrators pre-configure each operating day for services that have `configuracion_diaria = true`. Before any client can reserve a turn for such a service on a given date, an admin must create a `ConfiguracionDiaria` record that specifies how much cash is loaded in the ATM (or available at the window), the per-person withdrawal limit, and an optional reservation percentage that sets aside a portion of tickets. The system automatically calculates how many clients can be served and exposes only days with an `ABIERTA` configuration to the public terminal.
+
+<Warning>
+  Setting a configuration to **CERRADA** immediately prevents new reservations for that day. Any turns that are still in `RESERVADO` state when the configuration is closed will be transitioned to `EXPIRADO`, making them ineligible for use. This action cannot be undone without manually re-opening the configuration.
+</Warning>
+
+## Accessing the Calendar — `/admin/calendario`
+
+`ConfiguracionDiariaController::index()` renders a monthly grid view at `/admin/calendario`. The URL accepts `mes`, `anio`, and `servicio` query parameters. The grid shows one cell per calendar day; each cell that has a `ConfiguracionDiaria` record displays the current `estado`, the number of tickets generated, and the tickets remaining. Cells without a configuration are shown as empty and can be clicked to create one.
+
+A quick-stats panel beneath the header shows the average tickets generated per day and the total number of configurations created over the last 7 days for the selected service.
+
+## ConfiguracionDiaria Fields
+
+The `configuracion_diaria` table has a composite unique constraint on `(servicio_id, fecha)` — only one configuration record can exist per service per day.
+
+| Field | Type | Description |
+|---|---|---|
+| `fecha` | `date` | The calendar day this configuration applies to. Read-only in the form once set. |
+| `monto_cargado` | `decimal(12,2)` | Total cash loaded into the ATM or made available at the teller (in CUP). Required. Must be ≥ 0. |
+| `limite_por_persona` | `decimal(10,2)` | Maximum amount each client may withdraw. Required. Must be > 0. Used to automatically calculate `tickets_generados` and is also stored on each `Turno` as `monto_permitido`. |
+| `porcentaje_reserva` | `decimal(5,2)` | Percentage of the total cash set aside and excluded from public tickets (e.g. reserved for priority clients). Defaults to `0.00`. Range 0–100. |
+| `tickets_generados` | `integer (unsigned)` | Total number of turns the system will accept for this day. Calculated automatically (see formula below). |
+| `tickets_restantes` | `integer (unsigned)` | Turns not yet assigned. Decremented atomically inside a transaction each time a turn is confirmed. |
+| `estado` | `EstadoConfiguracion` | Current lifecycle status. See the status table below. |
+
+## Ticket Calculation Formula
+
+When the admin saves or previews a configuration, the system computes:
+
+```
+montoDisponible  = monto_cargado × (1 − porcentaje_reserva / 100)
+tickets_generados = floor(montoDisponible / limite_por_persona)
+```
+
+The admin form at `/admin/calendario/configurar/{servicioId}/{fecha}` performs this calculation client-side in real time via JavaScript as the admin types, displaying the result in the **Tickets Generados** field before the form is saved. The same formula is applied server-side by `ConfiguracionDiariaInterface::crearOActualizar()` when the POST is processed.
+
+**Example:** 500,000 CUP loaded, 5,000 CUP limit per person, 10% reservation:
+
+```
+montoDisponible  = 500,000 × 0.90 = 450,000
+tickets_generados = floor(450,000 / 5,000) = 90 tickets
+```
+
+## Estado Lifecycle
+
+`ConfiguracionDiaria` progresses through three states defined in `EstadoConfiguracion`:
+
+| Value | Label | Meaning |
+|---|---|---|
+| `ABIERTA` | Abierta | The configuration is active and accepting new turn reservations. This is the only state visible to clients on the public terminal. Default state on creation. |
+| `CERRADA` | Cerrada | The configuration is closed. No new reservations can be made. Existing `RESERVADO` turns are marked `EXPIRADO`. Typically set at the end of the operating day or when tickets are exhausted. |
+| `FINALIZADA` | Finalizada | The day's operations are fully complete. All turns have been either used, cancelled, or expired. Used for archival and reporting. |
+
+The stato can be set directly in the configuration form alongside the other fields. The `EstadoConfiguracion` enum values are passed to the Twig template as `estados` and rendered as a `<select>` element.
+
+## Concurrent Access and Optimistic Locking
+
+`ConfiguracionDiaria` carries an `@ORM\Version` field (`version`, integer). Doctrine increments this value on every `UPDATE`. If two admin sessions attempt to modify the same record simultaneously — or if a client is booking a turn at the same time an admin is editing the configuration — the second writer receives an `OptimisticLockException`, which surfaces as an error message asking the user to retry. The `decrementarTicketsRestantes()` method additionally throws `NoTicketsDisponiblesException` if `tickets_restantes < 1`, providing a hard guard even after the version check.
+
+## Creating or Editing a Configuration
+
+Navigate to a day cell in the calendar and click it to open `/admin/calendario/configurar/{servicioId}/{fecha}`. The form accepts `montoCargado`, `limitePorPersona`, `porcentajeReserva`, and `estado`. The `fecha` field is read-only. Submitting the form calls `ConfiguracionDiariaInterface::crearOActualizar()`, which wraps the save in a retryable transaction, then records a `CREATE` or `UPDATE` audit entry depending on whether a record previously existed for that service/date pair.
+
+The sidebar on the configuration form shows the selected service's `codigo`, `permite_reserva_futura`, `requiere_control_frecuencia`, and `dias_bloqueo` values as a quick reference.

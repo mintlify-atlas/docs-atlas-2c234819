@@ -1,0 +1,98 @@
+---
+title: "Configure SGR-Turnos Environment and Settings"
+description: "Learn how to set up your .env.local file, database connection string, application secret, and rate limiter settings for SGR-Turnos."
+---
+
+SGR-Turnos follows Symfony's standard environment file convention. All deployment-specific settings — database credentials, application secret, and environment mode — are stored in a local file that is never committed to version control. This page explains what each setting controls and how to configure it correctly for your branch server.
+
+## The `.env.local` File
+
+Symfony loads environment variables from a chain of `.env` files. For production deployments, you should only need to create one file:
+
+```bash
+cp .env .env.local
+```
+
+The `.env` file (committed to the repository) contains safe defaults and documentation comments. The `.env.local` file (gitignored) holds the actual secrets and machine-specific values. Variables in `.env.local` take precedence over those in `.env`.
+
+<Tip>
+  Never edit the `.env` file directly on a production server. Always make your changes in `.env.local` so that future `git pull` updates do not overwrite your configuration.
+</Tip>
+
+## Key Variables
+
+### `APP_ENV`
+
+Controls whether the application runs in development or production mode.
+
+```dotenv
+APP_ENV=prod
+```
+
+| Value | Use case |
+|---|---|
+| `prod` | Production — optimized performance, errors hidden from users, cache enabled |
+| `dev` | Development — Symfony debug toolbar, verbose error pages, cache disabled |
+
+Always set `APP_ENV=prod` on any server that branch staff or customers will use. Running in `dev` mode on a production machine exposes internal stack traces and disables performance optimizations.
+
+### `APP_SECRET`
+
+A random string used by Symfony to sign cookies, CSRF tokens, and other security-sensitive values.
+
+```dotenv
+APP_SECRET=replace-this-with-a-long-random-string
+```
+
+<Warning>
+  `APP_SECRET` must be a strong, unpredictable random string in production. If this value is leaked or guessable, an attacker can forge CSRF tokens and signed cookies. Generate it with a command like `openssl rand -hex 32` and never reuse the same secret across different deployments.
+</Warning>
+
+### `DATABASE_URL`
+
+The full connection string for the MySQL database.
+
+```dotenv
+DATABASE_URL="mysql://user:password@127.0.0.1:3306/sgr_turnos"
+```
+
+The format follows the DSN (Data Source Name) convention:
+
+```
+mysql://<username>:<password>@<host>:<port>/<database_name>
+```
+
+| Segment | Example | Description |
+|---|---|---|
+| `username` | `sgr_app` | MySQL user with SELECT, INSERT, UPDATE, DELETE, and DDL privileges on the database |
+| `password` | `s3cr3tP@ss` | Password for that MySQL user |
+| `host` | `127.0.0.1` | Hostname or IP of the MySQL server (use `127.0.0.1` for local installs) |
+| `port` | `3306` | MySQL default port; change only if your server listens on a non-standard port |
+| `database_name` | `sgr_turnos` | The database created during installation |
+
+For MariaDB, use the same `mysql://` scheme — the driver is compatible.
+
+## Complete `.env.local` Example
+
+```dotenv
+APP_ENV=prod
+APP_SECRET=a3f8c2e1d7b94f06a1e5c3d2b8f70914a2e6d4c8b1f3a5e7d9c2b4f6a8e0d2c4
+DATABASE_URL="mysql://sgr_app:str0ngPassw0rd@127.0.0.1:3306/sgr_turnos"
+```
+
+## Rate Limiting
+
+SGR-Turnos uses Symfony's `rate-limiter` component to protect the two most sensitive public endpoints against abuse:
+
+- **CI entry** (`/ingreso/procesar`) — the endpoint where customers submit their identity number. Rate limiting prevents automated scripts from probing for valid identity numbers.
+- **Turn reservation endpoints** — limits how many reservation attempts can be made from a single IP in a given time window, reducing the risk of scripted queue-flooding.
+
+Rate limiter configuration lives in Symfony's service configuration files under `config/`. No `.env.local` variable is required to enable it — rate limiting is active by default in both `dev` and `prod` environments. If you need to adjust the thresholds (for example, for a high-traffic branch), edit the limiter policy definitions in the framework configuration rather than adding environment overrides.
+
+<Note>
+  After any change to `.env.local`, clear the application cache before the new values take effect in production:
+
+  ```bash
+  php bin/console cache:clear
+  ```
+</Note>

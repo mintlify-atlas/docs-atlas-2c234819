@@ -1,0 +1,72 @@
+---
+title: "Service Management: Configure ATM and Teller Services"
+description: "Create and configure SGR-Turnos service types — ATM, teller windows, and others — with frequency control, daily quotas, and booking parameters."
+---
+
+A **Servicio** (service) is the foundational configuration object in SGR-Turnos. Every turn belongs to exactly one service, and the service's flags determine how the public terminal behaves: whether it demands an admin-managed daily configuration with a cash amount and per-person limit, how many days a client is blocked after use, and whether future-date bookings are allowed. Services are managed at `/admin/servicios` and require at minimum `ROLE_ADMIN`.
+
+The `Servicio` entity is stored in the `servicio` table with a `uk_servicio_codigo` unique constraint on the `codigo` column. A service can only be physically deleted if it has no associated `ConfiguracionDiaria` records and no `Turno` records. If either exists, the system rejects the deletion with a descriptive error and suggests deactivating the service instead.
+
+## Service Configuration Fields
+
+<ParamField path="codigo" type="string" required>
+  A short, unique identifier for the service (maximum 20 characters). Used in audit logs and URL parameters. Must be unique across all services — the controller rejects creation or update if another service already uses the same code.
+</ParamField>
+
+<ParamField path="nombre" type="string" required>
+  The human-readable display name shown to clients on the public terminal and to staff in the backoffice (maximum 100 characters).
+</ParamField>
+
+<ParamField path="descripcion" type="string">
+  An optional free-text description (up to 255 characters). Shown in search results within the backoffice service list.
+</ParamField>
+
+<ParamField path="permite_reserva_futura" type="boolean" default="true">
+  When `true`, clients may select a future date from the calendar. When `false`, only the current day is offered. Defaults to `true`.
+</ParamField>
+
+<ParamField path="requiere_control_frecuencia" type="boolean" default="true">
+  When `true`, the system activates the anti-scalping frequency block. After a turn is marked **USADO**, the client's CI is blocked from reserving another turn for the same service for `dias_bloqueo` days. When `false`, the same client may reserve consecutive turns with no waiting period.
+</ParamField>
+
+<ParamField path="dias_bloqueo" type="integer" default="7">
+  Number of days a client is blocked from reserving a new turn after their last turn is marked as used. Only meaningful when `requiere_control_frecuencia = true`. The default is **7 days**. The value is stored as an unsigned `smallint` and may be `null` (interpreted as 0 days) when frequency control is disabled.
+</ParamField>
+
+<Tip>
+  Set `dias_bloqueo` to match the realistic cash replenishment cycle at your branch. If the ATM is refilled every 3 days, setting `dias_bloqueo = 3` prevents any single customer from collecting cash on back-to-back refill days. The default of 7 ensures at most one withdrawal per client per week.
+</Tip>
+
+<ParamField path="activo" type="boolean" default="true">
+  Global on/off switch for the service. When `false`, the service is excluded from `ServicioRepository::findActivos()` and therefore never shown to clients on the public terminal. The toggle-active endpoint (`POST /admin/servicios/{id}/toggle-activo`) flips this flag and registers a `ACTIVAR` or `DESACTIVAR` audit action.
+</ParamField>
+
+<ParamField path="configuracion_diaria" type="boolean" default="true">
+  Controls whether this service **requires** a pre-created `ConfiguracionDiaria` record for each operating day. When `true`, an admin must configure the cash loaded, per-person limit, and porcentaje de reserva before that day appears as available in the public calendar. When `false`, the service falls back to the simplified fixed-quota mode.
+</ParamField>
+
+<ParamField path="listado_unico" type="boolean" default="false">
+  When `true` **and** `configuracion_diaria = false`, the service operates in **Listado Único** mode. There is no date selection: clients are placed on a single rolling list. The withdrawal amount is entered by the client directly in the data form and stored in `turno.monto_permitido`. Turn numbers are assigned sequentially across all dates using `getNextNumeroTurnoByServicioYFecha()`.
+
+  When `listado_unico = false` and `configuracion_diaria = false`, the service uses a daily fixed-quota calendar where configurations are auto-created on demand from `tickets_por_dia`.
+</ParamField>
+
+<ParamField path="tickets_por_dia" type="integer">
+  Maximum number of turns available per day when the service does **not** use `configuracion_diaria`. Only read when `configuracion_diaria = false` and `listado_unico = false`. If `null` or `0`, the system will not auto-create a daily configuration and no turns can be booked. Stored as an unsigned `smallint`.
+</ParamField>
+
+## Service Mode Matrix
+
+The combination of `configuracion_diaria` and `listado_unico` determines the public-terminal routing:
+
+| `configuracion_diaria` | `listado_unico` | Behaviour |
+|---|---|---|
+| `true` | any | Admin-managed daily config required. Calendar shows only days with `ABIERTA` config and remaining tickets. |
+| `false` | `false` | Simplified calendar. Configs auto-created on demand from `tickets_por_dia`. |
+| `false` | `true` | No date picker. Client goes directly to the data form. Amount field is required. |
+
+## Managing Services at `/admin/servicios`
+
+The service listing paginates at 10 records per page and supports search by `nombre`, `codigo`, or `descripcion`. Creating or editing a service submits to `POST /admin/servicios/crear` or `POST /admin/servicios/{id}/editar` respectively, both of which validate the CSRF token (`servicio_create`) and record a full before/after audit entry.
+
+All mutating operations require `ROLE_ADMIN` enforced via both the class-level `#[IsGranted('ROLE_ADMIN')]` attribute and explicit `denyAccessUnlessGranted()` calls inside each action.

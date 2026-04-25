@@ -1,0 +1,148 @@
+---
+title: "Concurrency Control: Safe Concurrent Turn Assignment"
+description: "How SGR-Turnos uses optimistic locking, retryable transactions, and a unique DB constraint to prevent duplicate turn numbers under concurrent load."
+---
+
+In a branch with several registration terminals running simultaneously, two operators can attempt to assign the last available ticket at the same moment. Without concurrency controls, both operations could read the same `tickets_restantes` value, both decrement it, and both write a turn with the same number—leaving the branch with a duplicate ticket and an inaccurate count. SGR-Turnos prevents this through a layered defence: an optimistic lock on `ConfiguracionDiaria`, a retry loop that handles transient collisions gracefully, a pessimistic SELECT FOR UPDATE during turn number generation, and a unique database constraint as an unconditional last-resort guard.
+
+<Warning>
+  Disabling or bypassing any of these concurrency controls in a multi-terminal environment will cause duplicate turn numbers. Even a single unguarded concurrent write is enough to produce duplicates under load.
+</Warning>
+
+## Optimistic locking on `ConfiguracionDiaria`
+
+Optimistic locking assumes that conflicts are rare. Rather than holding a database lock for the duration of an operation, it detects a conflict at commit time by comparing a version counter.
+
+`ConfiguracionDiaria` (`src/Entity/ConfiguracionDiaria.php`) carries a `version` field annotated with Doctrine's `#[ORM\Version]` attribute:
+
+```php src/Entity/ConfiguracionDiaria.php
+/**
+ * Version field for optimistic locking.
+ * Doctrine increments this automatically on every UPDATE.
+ * If two processes attempt to modify the same entity with different
+ * version numbers, an OptimisticLockException is raised.
+ */
+#[ORM\Version]
+#[ORM\Column(type: 'integer')]
+private int $version = 1;
+```
+
+When two operators simultaneously load the same `ConfiguracionDiaria` record, both read `version = N`. The first to commit succeeds and the database row advances to `version = N+1`. When the second operator's transaction tries to commit, Doctrine detects that the version in the database no longer matches the version it loaded and throws an `OptimisticLockException`. The retry loop (described below) then re-reads the fresh state and attempts the operation again.
+
+The entity also exposes a guarded decrement method that is always called inside a transaction:
+
+```php src/Entity/ConfiguracionDiaria.php
+/**
+ * Safe decrement of ticketsRestantes with integrity check.
+ * Must be called inside a transaction with active optimistic locking.
+ *
+ * @throws NoTicketsDisponiblesException if tickets are insufficient
+ */
+public function decrementarTicketsRestantes(int $cantidad = 1): self
+{
+    if ($this->ticketsRestantes < $cantidad) {
+        throw new NoTicketsDisponiblesException(
+            sprintf(
+                'No hay suficientes tickets disponibles. Solicitados: %d, Disponibles: %d',
+                $cantidad,
+                $this->ticketsRestantes
+            )
+        );
+    }
+    $this->ticketsRestantes -= $cantidad;
+    return $this;
+}
+```
+
+This method never assumes the in-memory count is still accurate—that assumption is only safe because the optimistic lock has already been verified by Doctrine before the flush reaches the database.
+
+## Retryable transactions
+
+`RetryableTransactionTrait` (`src/Doctrine/RetryableTransactionTrait.php`) provides the `executeWithRetry()` helper, which any service or controller can use by composing the trait:
+
+```php src/Doctrine/RetryableTransactionTrait.php
+protected function executeWithRetry(
+    EntityManagerInterface $em,
+    callable $callback,
+    int $maxRetries = 3
+): mixed {
+    $retryCount = 0;
+    do {
+        try {
+            $em->beginTransaction();
+            $result = $callback($em);
+            $em->flush();
+            $em->commit();
+            return $result;
+        } catch (OptimisticLockException $e) {
+            $em->rollback();
+            $retryCount++;
+            if ($retryCount > $maxRetries) {
+                throw new \RuntimeException(
+                    'No se pudo completar la operación después de varios intentos. Intente más tarde.',
+                    0,
+                    $e
+                );
+            }
+            // Clear the entity manager to obtain fresh data on the next attempt
+            $em->clear();
+            // Random back-off to reduce contention between competing processes
+            usleep(rand(10000, 50000)); // 10–50 ms
+        } catch (\Exception $e) {
+            $em->rollback();
+            throw $e;
+        }
+    } while ($retryCount <= $maxRetries);
+}
+```
+
+The retry strategy has three important characteristics:
+
+- **Entity manager clear**: `$em->clear()` is called before each retry so that stale in-memory entities (which would carry the old version number) are discarded. The callback must re-load any entities it needs from the database.
+- **Random back-off**: `usleep(rand(10000, 50000))` introduces a random delay of 10–50 ms between attempts. This reduces the probability that two competing processes will collide again on the next attempt.
+- **Hard limit**: after `$maxRetries` (default 3) failed attempts, a `RuntimeException` is thrown with a user-friendly message. This surfaces to the operator as a transient error they can resolve by trying again, rather than a silent duplicate.
+
+Only `OptimisticLockException` triggers a retry. Any other exception—such as a validation error or a network failure—rolls back the transaction and propagates immediately, because retrying would not help.
+
+## Pessimistic locking during turn number assignment
+
+While optimistic locking protects the ticket counter on `ConfiguracionDiaria`, turn number generation requires an additional guarantee: no two turns for the same configuration must receive the same `numero_turno` value. SGR-Turnos uses a SELECT FOR UPDATE query (pessimistic locking) when reading the current highest turn number before incrementing. This holds a row-level lock for the duration of the transaction, so a second concurrent request blocks at the database level rather than proceeding with a stale value.
+
+Pessimistic locking is complementary to optimistic locking: optimistic locking catches concurrent updates to the ticket counter, while the SELECT FOR UPDATE prevents a race between reading the maximum turn number and inserting the new row.
+
+## Unique constraint as a last-resort safety net
+
+`Turno` (`src/Entity/Turno.php`) declares a composite unique constraint at the database level:
+
+```php src/Entity/Turno.php
+#[ORM\UniqueConstraint(
+    name: 'uk_turno_configuracion_numero',
+    columns: ['configuracion_diaria_id', 'numero_turno']
+)]
+```
+
+This constraint means the database will reject any INSERT or UPDATE that would produce a duplicate `numero_turno` within the same `ConfiguracionDiaria`, regardless of what happened at the application layer. It is the final backstop: even if a bug in future code bypasses the optimistic lock or the pessimistic SELECT FOR UPDATE, the constraint prevents the duplicate from being persisted.
+
+A second constraint prevents the same client from holding two turns for the same daily configuration:
+
+```php src/Entity/Turno.php
+#[ORM\UniqueConstraint(
+    name: 'uk_turno_configuracion_cliente',
+    columns: ['configuracion_diaria_id', 'cliente_id']
+)]
+```
+
+## How the layers interact
+
+The following table shows how each mechanism responds to a typical conflict scenario:
+
+| Scenario | First layer that fires | Outcome |
+|---|---|---|
+| Two operators load the same `ConfiguracionDiaria` and both try to decrement `tickets_restantes` | `OptimisticLockException` on the second commit | `executeWithRetry()` rolls back, clears the entity manager, and retries with fresh data |
+| Two processes read the same maximum turn number before either inserts | SELECT FOR UPDATE on the turn number query | The second process blocks at the database until the first transaction commits, then reads the updated maximum |
+| Application bug bypasses both locks and attempts a duplicate insert | `uk_turno_configuracion_numero` unique constraint | Database raises an integrity constraint violation; no duplicate row is written |
+| Same client submits two turn requests for the same daily configuration | `uk_turno_configuracion_cliente` unique constraint | Database rejects the second insert regardless of application state |
+
+<Tip>
+  During load testing or when deploying additional terminals, verify concurrency behaviour by simulating simultaneous POST requests to the turn reservation endpoint. `executeWithRetry()` logs the retry count; a sustained retry rate above zero under normal load indicates that `maxRetries` or the back-off window may need tuning.
+</Tip>

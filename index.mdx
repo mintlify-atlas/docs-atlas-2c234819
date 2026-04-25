@@ -1,133 +1,50 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
-icon: 'star'
+title: "SGR-Turnos: Bank Branch Queue Management"
+description: "SGR-Turnos replaces physical bank queues with identity-verified virtual turns, enforcing withdrawal frequency limits and giving staff a full audit trail."
 ---
 
-## Setting up
+SGR-Turnos is a web application designed for bank branches that need to manage ATM and teller queues fairly and transparently. Instead of physical first-come-first-served lines where positions are bought and sold, the system issues numbered turns tied to each customer's national identity card (CI), applies configurable blocking periods to prevent daily withdrawals by the same person, and gives branch staff a printable daily roster and full audit trail.
 
-Get your documentation site up and running in minutes.
+The system runs entirely on a local network — no internet connection is required — and can be deployed on low-cost or recycled hardware with Apache or Nginx.
 
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Installation" icon="server" href="/installation">
+    Set up SGR-Turnos on your server with PHP, MySQL, and Composer in a few steps.
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Configuration" icon="gear" href="/configuration">
+    Configure your database, application secret, and environment variables.
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Public Registration" icon="id-card" href="/features/public-registration">
+    Learn how clients register turns at the self-service terminal using their CI.
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="Admin Backoffice" icon="shield-halved" href="/features/admin-backoffice">
+    Manage services, configure daily quotas, print rosters, and mark turns as used.
   </Card>
-</Columns>
+  <Card title="User Roles" icon="users" href="/admin/user-roles">
+    Understand the five roles: Super Admin, Admin, Supervisor, Operator, and Basic Operator.
+  </Card>
+  <Card title="Security Overview" icon="lock" href="/security/overview">
+    CSRF protection, rate limiting, IP anonymization, and optimistic locking explained.
+  </Card>
+</CardGroup>
 
-## Create beautiful pages
+## How it works
 
-Everything you need to create world-class documentation.
+<Steps>
+  <Step title="Client enters their identity card number">
+    At the public terminal (`/ingreso`), the customer types their 11-digit Cuban CI. The system validates format and birth-date, then checks whether the client is within a blocking period from a recent withdrawal.
+  </Step>
+  <Step title="Client selects a service and available date">
+    Unblocked clients choose a service (ATM, teller window, etc.) and a date that still has available quota. The calendar only shows dates that have been configured and still have open slots.
+  </Step>
+  <Step title="Client confirms and receives a printed ticket">
+    After providing name, phone number, and (where applicable) the withdrawal amount, the system assigns a unique turn number and presents a print-ready ticket.
+  </Step>
+  <Step title="Staff marks turns as used at end of day">
+    An admin or supervisor marks completed turns as **USADO** from the daily turn list. This automatically starts the client's blocking period, preventing another withdrawal before the configured number of days has passed.
+  </Step>
+</Steps>
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
-
-## Make your content agent ready
-
-Make your docs work for humans and AI agents alike.
-
-<Columns cols={2}>
-  <Card
-    title="Prompt component"
-    icon="robot"
-    href="/agent-ready/prompt"
-  >
-    Embed shareable AI prompts readers can copy or open in Cursor.
-  </Card>
-  <Card
-    title="Visibility"
-    icon="eye"
-    href="/agent-ready/visibility"
-  >
-    Show different content to humans and agents reading your docs.
-  </Card>
-  <Card
-    title="Contextual menu"
-    icon="bolt"
-    href="/agent-ready/contextual"
-  >
-    Give readers one-click access to Claude, ChatGPT, Cursor, and more.
-  </Card>
-  <Card
-    title="AI coding tools"
-    icon="wand-magic-sparkles"
-    href="/ai-tools/claude-code"
-  >
-    Set up Claude Code, Cursor, or Windsurf with Mintlify's skill.
-  </Card>
-</Columns>
-
-## Need inspiration?
-
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+<Note>
+  SGR-Turnos operates fully offline on a local area network (LAN). No cloud account or internet connection is needed during normal operation.
+</Note>

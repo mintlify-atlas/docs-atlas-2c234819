@@ -1,0 +1,125 @@
+---
+title: "Deploy SGR-Turnos with Docker Compose"
+description: "Use the included Docker Compose configuration to run SGR-Turnos with a PostgreSQL database container for development and testing environments."
+---
+
+The repository ships with a `compose.yaml` file that provides a containerized **PostgreSQL 16** database for development and testing. This is the fastest way to get a working database running locally without installing a database server directly on your machine.
+
+<Warning>
+The default database password in `compose.yaml` is `!ChangeMe!`. You must change this value before using the Compose setup in any environment other than your own local machine. Set the `POSTGRES_PASSWORD` environment variable or edit the Compose file directly.
+</Warning>
+
+## Database service
+
+The `compose.yaml` defines a single service named `database`:
+
+```yaml
+services:
+  database:
+    image: postgres:${POSTGRES_VERSION:-16}-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-!ChangeMe!}
+      POSTGRES_USER: ${POSTGRES_USER:-app}
+    healthcheck:
+      test: ["CMD", "pg_isready", "-d", "${POSTGRES_DB:-app}", "-U", "${POSTGRES_USER:-app}"]
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    volumes:
+      - database_data:/var/lib/postgresql/data:rw
+```
+
+### Environment variables
+
+All three database environment variables have defaults and can be overridden via your shell or a `.env` file:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `POSTGRES_DB` | `app` | Name of the database created on first start |
+| `POSTGRES_USER` | `app` | PostgreSQL user with full access to `POSTGRES_DB` |
+| `POSTGRES_PASSWORD` | `!ChangeMe!` | Password for `POSTGRES_USER` |
+| `POSTGRES_VERSION` | `16` | PostgreSQL image tag (alpine variant) |
+
+### Health check
+
+The container runs `pg_isready` every 5 seconds to confirm the database is accepting connections. Docker waits up to `start_period: 60s` before the health check failures count against the `retries: 5` limit. Dependent services (if added later) will not start until the database reports healthy.
+
+### Persistent volume
+
+A named volume `database_data` is mounted at `/var/lib/postgresql/data`. Data persists across container restarts and `docker compose stop` / `docker compose start` cycles. The volume is only removed if you explicitly run `docker compose down -v`.
+
+If you prefer a bind-mounted directory (for easier inspection or backup), replace the volume entry in `compose.yaml`:
+
+```yaml
+# Replace:
+- database_data:/var/lib/postgresql/data:rw
+# With:
+- ./docker/db/data:/var/lib/postgresql/data:rw
+```
+
+## Starting the database
+
+<Steps>
+  <Step title="Start the database container">
+    Run only the `database` service so you can keep PHP running directly on your host:
+
+    ```bash
+    docker compose up -d database
+    ```
+  </Step>
+  <Step title="Confirm the container is healthy">
+    ```bash
+    docker compose ps
+    ```
+
+    Wait until the `STATUS` column shows `healthy` before proceeding.
+  </Step>
+  <Step title="Configure DATABASE_URL">
+    In your `.env.local`, point Symfony at the containerized PostgreSQL instance. The port `5432` is exposed on a random host port by the development override (see below):
+
+    ```env
+    DATABASE_URL="postgresql://app:!ChangeMe!@127.0.0.1:5432/app?serverVersion=16&charset=utf8"
+    ```
+
+    Replace the password with whatever you set in `POSTGRES_PASSWORD`.
+  </Step>
+  <Step title="Run migrations">
+    ```bash
+    php bin/console doctrine:migrations:migrate
+    ```
+  </Step>
+</Steps>
+
+## Development overrides
+
+`compose.override.yaml` is automatically merged by Docker Compose when you run any `docker compose` command in the project root. It adds two development-only services:
+
+```yaml
+services:
+  database:
+    ports:
+      - "5432"      # Expose PostgreSQL on a random host port
+
+  mailer:
+    image: axllent/mailpit
+    ports:
+      - "1025"      # SMTP port for Symfony Mailer
+      - "8025"      # Mailpit web UI
+    environment:
+      MP_SMTP_AUTH_ACCEPT_ANY: 1
+      MP_SMTP_AUTH_ALLOW_INSECURE: 1
+```
+
+- **`database` ports** — The PostgreSQL port is published to a random available port on your host. Run `docker compose port database 5432` to find the actual port number.
+- **`mailer` (Mailpit)** — A local SMTP server and web UI for catching outgoing emails during development. Access the inbox at `http://localhost:8025`. This service is not part of `compose.yaml` and will not run in environments that exclude the override file.
+
+<Tip>
+For the best performance in a branch environment, run PHP directly on the host (via the Symfony CLI or Apache/Nginx) and use Docker only for the database container. This avoids the overhead of running PHP inside a container and makes Xdebug and other developer tools easier to configure.
+</Tip>
+
+## MySQL vs PostgreSQL
+
+The project README and `composer.json` target **MySQL 8.0 / MariaDB 10.5+** as the production database. The `compose.yaml` file uses **PostgreSQL 16** — this is the default generated by `symfony/doctrine-bundle` and is appropriate for development.
+
+If your production environment uses MySQL, ensure your `DATABASE_URL` uses the `mysql://` scheme and that the `pdo_mysql` PHP extension is enabled. Docker is not required for production; the Compose setup is provided for local development and CI convenience only.

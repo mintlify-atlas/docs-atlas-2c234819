@@ -1,0 +1,60 @@
+---
+title: "SGR-Turnos: Virtual Queue System for Bank Branches"
+description: "SGR-Turnos replaces physical ATM queues with identity-verified virtual turns, preventing turn reselling and enforcing per-client withdrawal frequency limits."
+---
+
+SGR-Turnos (Sistema de Gestión y Reserva de Turnos) is an internal web application built with **Symfony 8** and **PHP 8.4** that replaces the physical queue at bank branch ATMs with a structured, identity-verified reservation system. It stores data in **MySQL 8.0** (or MariaDB 10.5+) and renders all screens with **Twig** templates styled using Tailwind CSS. The system runs entirely on a local area network and requires no internet connection once deployed.
+
+## The Problem
+
+In many bank branches, a practice known locally as _colerismo_ undermines fair access to ATM services. Individuals arrive before opening hours to occupy the first positions in line, then sell those positions to other customers. A related problem is cash hoarding: the same person withdraws the daily maximum on consecutive days, acting as an informal intermediary and depleting the ATM for everyone else.
+
+These problems share a root cause — the physical queue has no memory and no identity link. There is no way to know who is in line, whether they withdrew yesterday, or whether they purchased their spot.
+
+| Problem | Operational consequence |
+|---|---|
+| **Turn reselling** | Individuals accumulate the first positions and sell them, creating disorder and unlawful profit. |
+| **Cash hoarding** | The same person withdraws the maximum nearly every day, acting as an intermediary and leaving the ATM empty for others. |
+| **No traceability** | There is no prior record of who will withdraw money or when their last withdrawal was. |
+
+## What SGR-Turnos Does
+
+SGR-Turnos substitutes the disordered physical queue with a **virtual appointment calendar**, enforcing three core controls:
+
+- **Identity-linked turns** — every reservation is bound to a national identity number (CI). A turn cannot exist without an identified person behind it, eliminating anonymous queue reselling.
+- **Frequency control** — the system enforces a configurable lockout period (default: 7 days) per identity number. A customer who has already withdrawn cannot reserve a new turn until the lockout expires.
+- **Audit trail** — every action in the system is logged with a timestamp, the responsible user, before/after data snapshots, and an anonymized IP address (SHA-256 hash with subnet masking).
+
+## Who Uses It
+
+<CardGroup cols={2}>
+  <Card title="Branch Staff" icon="shield-halved" href="/features/admin-backoffice">
+    Administrators, supervisors, and operators access the backoffice to configure services, manage the daily calendar, print the official turn list, and mark turns as used at the end of the day.
+  </Card>
+  <Card title="Bank Customers" icon="users" href="/features/public-registration">
+    Customers interact with a public-facing terminal in the branch lobby to enter their identity number, select a service and date, fill in their contact details, and receive a printed ticket.
+  </Card>
+</CardGroup>
+
+## Key Features
+
+<CardGroup cols={2}>
+  <Card title="Public Registration" icon="id-card" href="/features/public-registration">
+    Identity-validated self-service kiosk where customers register their turn, select a date with available slots, and print a ticket.
+  </Card>
+  <Card title="Admin Backoffice" icon="gear" href="/features/admin-backoffice">
+    Hierarchical role management (Super Admin, Admin, Supervisor, Operator) with full control over users, services, and daily operations.
+  </Card>
+  <Card title="Service Management" icon="list-check" href="/features/service-management">
+    Create and configure service types — ATM, teller window, and others — with per-service frequency control, lockout days, and daily ticket limits.
+  </Card>
+  <Card title="Daily Calendar" icon="calendar-days" href="/features/daily-calendar">
+    Define the loaded amount, per-person withdrawal limit, and reservation percentage for each day. Available tickets are calculated automatically.
+  </Card>
+  <Card title="Security Overview" icon="lock" href="/security/overview">
+    CSRF protection, bcrypt/argon2 password hashing, Symfony Voters for granular authorization, rate limiting on public endpoints, and optimistic/pessimistic locking for concurrent turn assignment.
+  </Card>
+  <Card title="Audit Log" icon="scroll" href="/admin/audit-log">
+    Complete record of every system action including entity snapshots, responsible user, and anonymized IP — exportable alongside daily turn lists in Excel format.
+  </Card>
+</CardGroup>

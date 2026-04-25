@@ -1,0 +1,84 @@
+---
+title: "User Roles and Permissions in SGR-Turnos"
+description: "SGR-Turnos uses five roles — Super Admin, Admin, Supervisor, Operator, and Basic Operator — to control access to queues, configuration, and reporting."
+---
+
+SGR-Turnos enforces access control through a hierarchy of five roles stored in the `rol` table. Each `Usuario` entity carries exactly one role, and Symfony's security layer — including two custom Voters (`TurnoVoter` and `UsuarioVoter`) — evaluates that role on every protected action. Roles are identified by their `ROLE_` prefixed name (e.g. `ROLE_SUPER_ADMIN`, `ROLE_ADMIN`, `ROLE_SUPERVISOR`, `ROLE_OPERADOR`, `ROLE_OPERADOR_BASICO`) and must be seeded into the database before any user can log in.
+
+## The Five Roles
+
+<CardGroup cols={2}>
+  <Card title="Super Admin" icon="shield-halved">
+    Full system access. Can create and modify all other users including other admins, delete turns, and run privileged console commands. The only role that can modify or delete a `ROLE_ADMIN` account (`UsuarioVoter` enforces this: an admin attempting to edit a Super Admin is denied).
+  </Card>
+  <Card title="Admin" icon="user-gear">
+    Manages services (`/admin/servicios`), daily configurations (`/admin/calendario`), and all user accounts except Super Admin accounts. Can view and filter the full audit log at `/admin/auditoria`. Can edit turns but cannot delete them — deletion is reserved for Super Admin.
+  </Card>
+  <Card title="Supervisor" icon="clipboard-list">
+    Focused on day-of operations. Can view today's turn list, mark turns as used, and print or export the official daily roster. Does not have access to service configuration or user management.
+  </Card>
+  <Card title="Operator" icon="ticket">
+    Standard turn management. Can view individual turns (`TurnoVoter` grants `VIEW` to `ROLE_OPERADOR`). Cannot edit, delete, or reconfigure turns or any other entity.
+  </Card>
+  <Card title="Basic Operator" icon="eye">
+    Minimum access level (`ROLE_OPERADOR_BASICO`). Read-only view of turn data. Intended for staff who need visibility into the queue without any ability to modify records.
+  </Card>
+</CardGroup>
+
+## Permission Matrix
+
+The table below summarizes which admin feature areas each role can access. "Write" means create/edit/delete; "Read" means view-only.
+
+| Feature Area | Super Admin | Admin | Supervisor | Operator |
+|---|---|---|---|---|
+| `/admin/servicios` — service configuration | Write | Write | — | — |
+| `/admin/calendario` — daily configurations | Write | Write | — | — |
+| `/admin/turnos/hoy` — today's turn list | Write | Write | Read | Read |
+| `/admin/turnos/{id}/editar` — edit a turn | Write | Write | — | — |
+| `/admin/turnos/{id}/eliminar` — delete a turn | Write | — | — | — |
+| `/admin/listados` — turn roster and export | Write | Write | Read | — |
+| `/admin/usuarios` — user management | Write | Write\* | — | — |
+| `/admin/auditoria` — audit log | Read | Read | — | — |
+| `/admin/estadisticas` — statistics dashboard | Read | Read | — | — |
+
+\*Admin can manage all users **except** Super Admin accounts. `UsuarioVoter` blocks the operation if the target user holds `ROLE_SUPER_ADMIN` and the acting user does not.
+
+## Seeding Roles and Creating the First Super Admin
+
+Roles are not created through the web interface — they must be loaded into the database via a console command before any user can be assigned one.
+
+```bash
+# 1. Load all predefined roles into the database
+php bin/console app:load-roles
+
+# 2. Create the first Super Admin interactively
+php bin/console app:create-super-admin
+```
+
+The `app:create-super-admin` command is interactive: it prompts for a username, full name, and password, then persists a `Usuario` entity assigned to the `ROLE_SUPER_ADMIN` role. This is the only way to bootstrap the first administrator; subsequent admins can be created through the web interface at `/admin/usuarios`.
+
+## Managing Users at `/admin/usuarios`
+
+The user management screen at `/admin/usuarios` lists all users with pagination (10 per page) and supports search by full name, username, or email. From this screen an authorized admin can:
+
+- **Create** a new user via the "Nuevo Usuario" modal, selecting their role and active status.
+- **Edit** an existing user's name, email, role, and active status. The username cannot be changed after creation.
+- **Toggle active status** — disabling a user prevents login without deleting their history.
+- **Delete** a user — only permitted if the user has not created any daily configurations and has not marked any turns as used. If either dependency exists, the system requires deactivation instead of deletion.
+
+Every create, update, toggle, and delete action on a user is recorded automatically in the audit log by `AuditoriaService`.
+
+<Note>
+  Passwords must be at least 8 characters long. This is enforced both in the browser (JavaScript real-time validation) and on the server (`UsuarioController::update` returns an error if `strlen($password) < 8`). Passwords are never stored in plain text — they are hashed using bcrypt or argon2 via Symfony's `UserPasswordHasherInterface`. The `getSalt()` method on `Usuario` returns `null` because modern algorithms handle salting internally.
+</Note>
+
+## How Voters Enforce Granular Permissions
+
+Beyond role-based route guards (`#[IsGranted('ROLE_ADMIN')]`), SGR-Turnos uses two Symfony Voters for object-level authorization:
+
+- **`UsuarioVoter`** — governs `EDIT`, `DELETE`, and `TOGGLE` on `Usuario` objects. Denies any action where the acting user and the target user are the same person, and denies any action where a non-Super-Admin tries to modify a Super Admin account.
+- **`TurnoVoter`** — governs `VIEW`, `EDIT`, and `DELETE` on `Turno` objects. `VIEW` is granted to Admin, Super Admin, and Operator roles; `EDIT` to Admin and Super Admin only; `DELETE` to Super Admin only.
+
+<Warning>
+  A user cannot modify or deactivate their own account. `UsuarioController::toggleActivo` explicitly checks `$usuario === $this->getUser()` and returns an error if they match, and `UsuarioVoter` enforces the same rule for edits and deletes.
+</Warning>

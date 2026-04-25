@@ -1,0 +1,88 @@
+---
+title: "System Requirements for SGR-Turnos"
+description: "Hardware and software prerequisites for running SGR-Turnos: PHP 8.4, MySQL 8.0, Composer 2, Apache or Nginx, and optional Node.js for CSS compilation."
+---
+
+SGR-Turnos is a Symfony 8 / PHP 8.4 web application designed to run entirely on a local area network inside a bank branch. It has no internet dependency during normal operation and is intended to be deployed on existing or recycled hardware. The requirements below reflect what is declared in `composer.json` and the project README.
+
+<Note>
+SGR-Turnos is a LAN-only system. Once installed, it requires no internet connection. All client terminals, the administration workstation, and the printer communicate over the branch's internal network. This makes it suitable for environments with limited or no connectivity to external networks.
+</Note>
+
+## Software requirements
+
+### PHP
+
+PHP **8.4 or later** is required. This is enforced by the `composer.json` constraint `"php": ">=8.4"`. The following PHP extensions must be enabled:
+
+| Extension | Purpose |
+|-----------|---------|
+| `pdo_mysql` | Database connectivity via Doctrine ORM |
+| `intl` | Internationalization support (`symfony/intl`) |
+| `mbstring` | Multi-byte string handling |
+| `ctype` | Character type functions (Symfony polyfill replacement) |
+| `json` | JSON encoding and decoding |
+| `bcmath` | Arbitrary-precision arithmetic |
+| `iconv` | Character encoding conversion (Symfony polyfill replacement) |
+
+Verify your PHP installation covers these extensions before running `composer install`.
+
+### Database
+
+**MySQL 8.0** or **MariaDB 10.5+** is required for production deployments. Doctrine ORM manages all schema changes through migrations; no manual SQL setup is needed beyond creating the initial database and running `php bin/console doctrine:migrations:migrate`.
+
+<Note>
+The included Docker Compose file (`compose.yaml`) uses **PostgreSQL 16** rather than MySQL. This is suitable for development and testing environments. For production branch deployments, MySQL 8.0 or MariaDB 10.5+ is the documented and tested target.
+</Note>
+
+### Composer
+
+**Composer 2.x** is required to install PHP dependencies. Composer 1.x is not supported.
+
+```bash
+composer --version
+# Composer version 2.x.x
+```
+
+### Web server
+
+An **Apache** or **Nginx** server with URL rewriting enabled is required. The application entry point is `public/index.php`. The document root must be set to the `public/` directory.
+
+**Apache** — enable `mod_rewrite` and ensure `.htaccess` overrides are allowed (`AllowOverride All`).
+
+**Nginx** — configure `try_files` to route all requests through `index.php`:
+
+```nginx
+location / {
+    try_files $uri /index.php$is_args$args;
+}
+```
+
+### Node.js and npm (optional)
+
+Node.js and npm are **only required if you intend to modify the Tailwind CSS styles**. The project uses `symfonycasts/tailwind-bundle` for CSS compilation. Pre-compiled assets are included in the repository, so this step can be skipped for most deployments.
+
+```bash
+# Only needed when modifying CSS
+npm install
+npm run build
+```
+
+## Hardware requirements
+
+SGR-Turnos is explicitly designed to run on **low-cost or recycled hardware** within a branch's local network. No high-performance server is required.
+
+<CardGroup cols={2}>
+  <Card title="Server" icon="server">
+    Any PC capable of running PHP 8.4 and MySQL 8.0. A machine with 2 GB RAM and a dual-core processor is sufficient for a single-branch deployment.
+  </Card>
+  <Card title="Client terminals" icon="monitor">
+    Any browser-capable device on the LAN. The public registration terminal and the administration workstation are standard PCs or tablets connected to the branch network.
+  </Card>
+  <Card title="Printer" icon="printer">
+    A matrix or laser printer accessible from the web server or connected to the LAN. Used to print the official daily turn list and individual tickets.
+  </Card>
+  <Card title="Network" icon="network">
+    A standard branch LAN. No internet access is required during operation. All traffic is internal between the web server, database, client terminals, and printer.
+  </Card>
+</CardGroup>

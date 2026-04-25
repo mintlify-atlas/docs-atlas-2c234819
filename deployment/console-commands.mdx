@@ -1,0 +1,180 @@
+---
+title: "Console Commands Reference for SGR-Turnos"
+description: "Reference for SGR-Turnos console commands: app:load-roles, app:create-super-admin, and app:backup:database — covering setup and ongoing maintenance."
+---
+
+SGR-Turnos includes three custom Symfony console commands located in `src/Command/`. Two are required during the initial installation (`app:load-roles` and `app:create-super-admin`) and one handles ongoing database maintenance (`app:backup:database`). All commands are invoked via `php bin/console` from the project root.
+
+## app:load-roles
+
+```bash
+php bin/console app:load-roles
+```
+
+This command inserts the five predefined system roles into the database. It checks for each role by name before creating it, so roles that already exist are skipped without error.
+
+**When to run:** Once, immediately after running `doctrine:migrations:migrate`, and before creating any users. The `app:create-super-admin` command will create the `ROLE_SUPER_ADMIN` role automatically if it is missing, but running `app:load-roles` first ensures all roles are present consistently.
+
+<Note>
+`app:load-roles` is idempotent. It is safe to run multiple times — existing roles are detected and left unchanged. The command reports how many roles were created and how many already existed.
+</Note>
+
+The five roles loaded by this command are:
+
+| Role name | Description |
+|-----------|-------------|
+| `ROLE_OPERADOR_BASICO` | Operador básico: acceso mínimo a turnos |
+| `ROLE_OPERADOR` | Operador: gestión completa de turnos |
+| `ROLE_SUPERVISOR` | Supervisor: supervisión y reportes |
+| `ROLE_ADMIN` | Administrador: configuración del sistema |
+| `ROLE_SUPER_ADMIN` | Super Administrador: acceso total sin restricciones |
+
+**Example output:**
+
+```
+Carga de roles del sistema
+==========================
+
+ ✓ Rol ROLE_OPERADOR_BASICO creado.
+ ✓ Rol ROLE_OPERADOR creado.
+ ✓ Rol ROLE_SUPERVISOR creado.
+ ✓ Rol ROLE_ADMIN creado.
+ ✓ Rol ROLE_SUPER_ADMIN creado.
+
+ [OK] Carga completada: 5 roles creados, 0 ya existían.
+```
+
+---
+
+## app:create-super-admin
+
+```bash
+php bin/console app:create-super-admin
+```
+
+This command creates a new user with the `ROLE_SUPER_ADMIN` role. Run it once after the initial installation to create the first administrator account. You can run it again later to create additional super admin users.
+
+**When to run:** After `app:load-roles` and `doctrine:migrations:migrate`, as the final step of the initial setup. At least one super admin account must exist before anyone can log into the backoffice.
+
+### Interactive mode (default)
+
+When run without options, the command prompts for each field in sequence. The password prompt is hidden (input is not echoed):
+
+```
+Creación de Usuario Super Admin
+================================
+
+Nombre de usuario: admin
+Correo electrónico: admin@sucursal.cu
+Nombre completo: Administrador Principal
+Contraseña (mínimo 8 caracteres):
+```
+
+All fields are validated before the user is created:
+- Username must not be empty.
+- Email must be a valid address.
+- Full name must not be empty.
+- Password must be at least 8 characters. Input is hidden and cannot be set via a command-line option.
+
+### Non-interactive mode
+
+Pass `--username`, `--email`, and `--fullname` to skip the prompts. The `--no-interaction` (`-n`) flag is required to activate this mode:
+
+```bash
+php bin/console app:create-super-admin \
+  --username=admin \
+  --email=admin@sucursal.cu \
+  --fullname="Administrador Principal" \
+  --no-interaction
+```
+
+<Warning>
+In non-interactive mode, no password can be set. The user is created with an empty password hash and **cannot log in** until a password is assigned through another means. The command displays a warning to this effect. Use interactive mode whenever possible.
+</Warning>
+
+### Options
+
+| Option | Short | Description |
+|--------|-------|-------------|
+| `--username` | `-u` | Username for the new account |
+| `--email` | `-m` | Email address |
+| `--fullname` | `-f` | Full display name |
+| `--no-interaction` | `-n` | Skip interactive prompts (requires the above three options) |
+
+If `ROLE_SUPER_ADMIN` does not exist in the database when this command runs, it is created automatically before the user is inserted.
+
+---
+
+## app:backup:database
+
+```bash
+php bin/console app:backup:database
+```
+
+This command produces a `mysqldump` of the MySQL database defined in the `DATABASE_URL` environment variable and saves it to `var/backups/db/` inside the project directory. It is configured through `config/packages/backup.yaml`.
+
+**When to run:** On a scheduled basis (e.g., via a cron job) or manually before applying migrations or making significant configuration changes.
+
+### How it works
+
+<Steps>
+  <Step title="Parse DATABASE_URL">
+    The command reads the `DATABASE_URL` environment variable and extracts the host, port, user, password, and database name. The URL must use the `mysql://` scheme.
+  </Step>
+  <Step title="Create the backup directory">
+    The output directory (`var/backups/db` by default) is created automatically if it does not exist, with permissions `0750`.
+  </Step>
+  <Step title="Run mysqldump">
+    The command invokes `mysqldump` as a subprocess using Symfony Process. The dump is written to a file named `dump_YYYY-MM-DD_HH-II-SS.sql` (using the `filename_prefix` from configuration). The default mysqldump options are `--single-transaction --quick --lock-tables=false --no-tablespaces`.
+  </Step>
+  <Step title="Compress with gzip (optional)">
+    If `compress: true` is set in `backup.yaml` (the default), the `.sql` file is compressed to `.sql.gz` using PHP's `gzopen`. The uncompressed `.sql` file is deleted after compression.
+  </Step>
+  <Step title="Rotate old backups">
+    After a successful dump, backup files matching the configured prefix that are older than `retention_days` (default: 7) are deleted automatically.
+  </Step>
+</Steps>
+
+### Configuration
+
+Backup behavior is controlled by `config/packages/backup.yaml`:
+
+```yaml
+parameters:
+    backup:
+        directory: '%kernel.project_dir%/var/backups/db'
+        retention_days: 7
+        compress: true
+        filename_prefix: 'dump_'
+        mysqldump_options:
+            - '--single-transaction'
+            - '--quick'
+            - '--lock-tables=false'
+            - '--no-tablespaces'
+        ignore_tables: []
+        timeout: 300
+```
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `directory` | `var/backups/db` | Output directory, relative to `%kernel.project_dir%` |
+| `retention_days` | `7` | Backups older than this many days are deleted. Set to `0` to disable rotation. |
+| `compress` | `true` | Compress the dump with gzip after creation |
+| `filename_prefix` | `dump_` | Prefix for backup filenames. The timestamp is appended automatically. |
+        | `mysqldump_options` | See above | Extra flags passed directly to `mysqldump` |
+| `ignore_tables` | `[]` | Tables to exclude from the dump (e.g. `doctrine_migration_versions`) |
+| `timeout` | `300` | Maximum time in seconds for the `mysqldump` process |
+
+<Warning>
+The `mysqldump` binary must be installed and accessible in the system `PATH` on the server running this command. On Debian/Ubuntu systems, it is included in the `mysql-client` package. The command reads the MySQL connection details from `DATABASE_URL`, not from the Docker Compose PostgreSQL container — ensure `DATABASE_URL` points to your MySQL instance when running backups.
+</Warning>
+
+### Scheduling with cron
+
+To run a daily backup at 2:00 AM, add the following entry to the server's crontab:
+
+```bash
+0 2 * * * /usr/bin/php /path/to/sgr-turnos/bin/console app:backup:database >> /var/log/sgr-turnos-backup.log 2>&1
+```
+
+Replace `/path/to/sgr-turnos` with the absolute path to your project root.
